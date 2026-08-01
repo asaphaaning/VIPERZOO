@@ -1,0 +1,16 @@
+[package]
+edition.workspace      = true
+license.workspace      = true
+name                   = "viperzoo-capture"
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+hex.workspace        = true
+serde.workspace      = true
+serde_json.workspace = true
+tracing.workspace    = true
+viperzoo-protocol    = { version = "0.1.0", path = "../protocol" }
+
+[lints]
+workspace = true

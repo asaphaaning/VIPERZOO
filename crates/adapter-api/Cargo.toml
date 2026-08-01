@@ -1,0 +1,13 @@
+[package]
+edition.workspace      = true
+license.workspace      = true
+name                   = "viperzoo-adapter-api"
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+thiserror.workspace = true
+viperzoo-protocol   = { version = "0.1.0", path = "../protocol" }
+
+[lints]
+workspace = true

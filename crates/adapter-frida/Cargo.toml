@@ -1,0 +1,25 @@
+[package]
+edition.workspace      = true
+license.workspace      = true
+name                   = "viperzoo-adapter-frida"
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+frida.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [ "rt", "sync" ] }
+tracing.workspace = true
+viperzoo-adapter-api = { version = "0.1.0", path = "../adapter-api" }
+viperzoo-engine = { version = "0.1.0", path = "../engine" }
+viperzoo-protocol = { version = "0.1.0", path = "../protocol" }
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

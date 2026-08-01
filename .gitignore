@@ -1,0 +1,13 @@
+# Local editor, synchronisation, and operating-system metadata.
+.idea
+.stfolder
+.DS_Store
+*.iml
+Thumbs.db
+
+# Cargo build output, including named local target directories.
+/target/
+/target-*/
+*.pdb
+
+captures/

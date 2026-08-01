@@ -1,0 +1,21 @@
+[package]
+edition.workspace      = true
+license.workspace      = true
+name                   = "viperzoo-engine"
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+thiserror.workspace  = true
+tokio                = { workspace = true, features = [ "sync" ] }
+tracing.workspace    = true
+viperzoo-adapter-api = { version = "0.1.0", path = "../adapter-api" }
+viperzoo-world       = { version = "0.1.0", path = "../world" }
+
+[dev-dependencies]
+hex.workspace     = true
+tokio             = { workspace = true, features = [ "macros", "rt", "sync" ] }
+viperzoo-protocol = { version = "0.1.0", path = "../protocol" }
+
+[lints]
+workspace = true

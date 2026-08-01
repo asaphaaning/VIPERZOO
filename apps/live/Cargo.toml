@@ -1,0 +1,29 @@
+[package]
+edition.workspace      = true
+license.workspace      = true
+name                   = "viperzoo-live"
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+  "fs",
+  "io-std",
+  "io-util",
+  "macros",
+  "rt",
+  "time",
+] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+viperzoo-adapter-api = { version = "0.1.0", path = "../../crates/adapter-api" }
+viperzoo-capture = { version = "0.1.0", path = "../../crates/capture" }
+viperzoo-engine = { version = "0.1.0", path = "../../crates/engine" }
+viperzoo-protocol = { version = "0.1.0", path = "../../crates/protocol" }
+viperzoo-world = { version = "0.1.0", path = "../../crates/world" }
+
+[lints]
+workspace = true

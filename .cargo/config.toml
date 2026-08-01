@@ -1,0 +1,7 @@
+[alias]
+ci-clippy = "clippy --workspace --all-targets --all-features -- -D warnings"
+
+[target.x86_64-pc-windows-msvc]
+# Frida's Windows core devkit is built against the static MSVC CRT. Keep the
+# Rust host on the same ABI instead of mixing LIBCMT and MSVCRT in one process.
+rustflags = ["-C", "target-feature=+crt-static"]

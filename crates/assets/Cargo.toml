@@ -1,0 +1,14 @@
+[package]
+edition.workspace      = true
+license.workspace      = true
+name                   = "viperzoo-assets"
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace   = true
+viperzoo-protocol   = { version = "0.1.0", path = "../protocol" }
+
+[lints]
+workspace = true

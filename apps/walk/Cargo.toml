@@ -1,0 +1,23 @@
+[package]
+edition.workspace      = true
+license.workspace      = true
+name                   = "viperzoo-walk"
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+viperzoo-adapter-frida = { version = "0.1.0", path = "../../crates/adapter-frida" }
+viperzoo-sdk = { version = "0.1.0", path = "../../crates/sdk" }
+
+[lints]
+workspace = true
