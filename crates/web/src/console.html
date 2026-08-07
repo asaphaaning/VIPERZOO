@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VIPERZOO — engine console</title>
+<style>
+  :root {
+    --bg:        #0a0c09;
+    --panel:     #0c0e0b;
+    --raised:    #151814;
+    --line:      #2c3329;
+    --line-soft: #1e231c;
+    --amber:     #e0b25f;
+    --amber-dim: #9a8f6d;
+    --text:      #d8d6cf;
+    --muted:     #5f6a61;
+    --muted-alt: #78837a;
+    --good:      #7fd6a3;
+    --bad:       #d68b7f;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 12px/1.5 "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 22px;
+    padding: 9px 14px; border-bottom: 1px solid var(--line);
+    background: var(--panel); flex: none;
+  }
+  .brand { color: var(--amber); letter-spacing: .13em; font-weight: 600; }
+  .brand small { color: var(--muted); letter-spacing: .06em; font-weight: 400; margin-left: 8px; }
+  .stat { display: flex; flex-direction: column; line-height: 1.25; }
+  .stat b { color: var(--text); font-weight: 500; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-size: 10px; letter-spacing: .14em; }
+  .badge {
+    margin-left: auto; padding: 3px 10px; border: 1px solid var(--line);
+    border-radius: 2px; letter-spacing: .12em; font-size: 10px;
+  }
+  .badge.up   { color: var(--good); border-color: #2f382d; }
+  .badge.down { color: var(--bad);  border-color: #3a2c29; }
+
+  main { flex: 1; display: grid; grid-template-columns: 258px 1fr 292px; gap: 1px; background: var(--line-soft); min-height: 0; }
+  .col { display: flex; flex-direction: column; gap: 1px; background: var(--line-soft); min-height: 0; overflow: hidden; }
+  /* `min-height: 0` lets a panel shrink below its content; `overflow: hidden`
+     is what stops it growing past its flex allocation. Without it the tile-map
+     panel measured 2832px tall inside a 100vh page, and the grid — which sizes
+     itself to the box it is given — faithfully rendered a 12x48 strip. */
+  section { background: var(--panel); display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  section > h2 {
+    font-size: 10px; letter-spacing: .16em; color: var(--amber-dim); font-weight: 500;
+    padding: 7px 11px; border-bottom: 1px solid var(--line-soft);
+    display: flex; justify-content: space-between; flex: none;
+  }
+  section > h2 em { font-style: normal; color: var(--muted); letter-spacing: .04em; }
+  .body { padding: 8px 11px; overflow: auto; min-height: 0; }
+  .grow { flex: 1; }
+
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+  .kv dd.absent { color: #46504a; }
+
+  .meter { height: 3px; background: var(--raised); border-radius: 2px; overflow: hidden; margin-top: 5px; }
+  .meter i { display: block; height: 100%; background: var(--amber); }
+  .meter.vita i { background: #c9705f; }
+  .meter.mana i { background: #5f86c9; }
+
+  /* The measured box must not depend on what the grid puts inside it, or the
+     observer that sizes the grid re-fires on its own output and ratchets the
+     panel until it displaces its siblings. */
+  .mapbox { flex: 1; min-height: 0; min-width: 0; position: relative; overflow: hidden; }
+  /* The window is a fixed number of tiles, so content never rescales it; the
+     cells then stretch to whatever the box gives them. Sizing is therefore a
+     layout result rather than a measurement JavaScript has to keep in sync,
+     which is what previously left a 21-column grid stranded in a 40-column
+     panel. `aspect-ratio` keeps cells square while `max-*` keeps the grid
+     inside the box on whichever axis runs out first. */
+  .grid {
+    position: absolute; inset: 0; margin: auto;
+    max-width: 100%; max-height: 100%;
+    aspect-ratio: var(--cols) / var(--rows);
+    display: grid; gap: 1px;
+    grid-template-columns: repeat(var(--cols), 1fr);
+    grid-template-rows: repeat(var(--rows), 1fr);
+  }
+  .cell { background: #12160f; border-radius: 1px; }
+  .cell.void    { background: #0b0d0a; }
+  .cell.blocked { background: #3a2c29; }
+  .cell.fixture { background: #2a2519; }
+  .cell.entity  { background: var(--amber); }
+  .cell.item    { background: #4d564f; }
+  .cell.player  { background: var(--good); }
+  .legend { display: flex; gap: 14px; padding: 0 11px 9px; color: var(--muted); font-size: 10px; flex: none; }
+  .legend b { display: inline-block; width: 9px; height: 9px; border-radius: 1px; margin-right: 5px; vertical-align: -1px; }
+
+  .log { font-size: 11px; line-height: 1.45; }
+  .line { display: grid; grid-template-columns: 52px 42px 1fr; gap: 9px; padding: 1px 0; }
+  .line time { color: #414a43; font-variant-numeric: tabular-nums; }
+  .line .lvl { letter-spacing: .06em; }
+  .line .msg { color: var(--text); word-break: break-word; }
+  .line .msg em { font-style: normal; color: var(--muted-alt); }
+  .ERROR .lvl { color: var(--bad); }
+  .WARN  .lvl { color: var(--amber); }
+  .INFO  .lvl { color: var(--good); }
+  .DEBUG .lvl, .TRACE .lvl { color: var(--muted); }
+
+  ul { list-style: none; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 1px 0; }
+  .row span { color: var(--muted); }
+  .row b { font-weight: 400; font-variant-numeric: tabular-nums; }
+  .chat li { color: var(--muted-alt); padding: 1px 0; word-break: break-word; }
+  .empty { color: #3f483f; font-style: italic; }
+  .offline { padding: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="root"><div class="offline">Loading console…</div></div>
+
+<script type="module">
+import { createElement as h, useState, useEffect, useRef, useMemo, StrictMode }
+  from "https://esm.sh/react@18.3.1";
+import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
+
+const LOG_LIMIT = 400;
+
+// ── Small presentational pieces ────────────────────────────────────────────
+
+const Stat = ({ label, value }) =>
+  h("div", { className: "stat" }, h("span", null, label), h("b", null, value ?? "—"));
+
+const Panel = ({ title, note, grow, style, children }) =>
+  h("section", { className: grow ? "grow" : undefined, style },
+    h("h2", null, title, note === undefined ? null : h("em", null, note)),
+    children);
+
+/// Renders key/value rows, dimming values the engine has not observed.
+const Rows = ({ pairs }) =>
+  h("dl", { className: "kv" }, pairs.flatMap(([key, value]) => [
+    h("dt", { key: `${key}-k` }, key),
+    h("dd", { key: `${key}-v`, className: value === null || value === undefined ? "absent" : undefined },
+      value ?? "—"),
+  ]));
+
+const List = ({ items, empty }) =>
+  h("ul", null, items.length
+    ? items
+    : h("li", { className: "empty" }, empty));
+
+const Meter = ({ kind, ratio }) =>
+  h("div", { className: `meter ${kind}` }, h("i", { style: { width: `${ratio}%` } }));
+
+// ── Tile map ───────────────────────────────────────────────────────────────
+
+/// Measures how many fixed-size cells fit the panel.
+///
+/// The cell size is deliberately constant. Sizing cells to the bounding box of
+/// currently known tiles made the whole map rescale every time the viewport
+/// scrolled or a new region streamed in, which reads as the map lurching in
+/// and out. A fixed cell with a moving window pans instead.
+function useViewport(box) {
+  const [viewport, setViewport] = useState({ columns: MIN_CELLS, rows: MIN_CELLS });
+
+  useEffect(() => {
+    const fit = () => {
+      const node = box.current;
+      if (!node) return;
+      const rect = node.getBoundingClientRect();
+      const step = CELL + GAP;
+      const clamp = (value) =>
+        Math.max(MIN_CELLS, Math.min(MAX_CELLS, Math.floor(value)));
+
+      setViewport({
+        columns: clamp((rect.width - PAD) / step),
+        rows: clamp((rect.height - PAD) / step),
+      });
+    };
+
+    fit();
+    const observer = new ResizeObserver(fit);
+    if (box.current) observer.observe(box.current);
+    return () => observer.disconnect();
+  }, [box]);
+
+  return viewport;
+}
+
+const CELL = 32, GAP = 1, PAD = 20;
+/// Bounds on the window so a narrow panel still shows a usable area and a wide
+/// one never renders thousands of cells.
+const MIN_CELLS = 12, MAX_CELLS = 48;
+
+function TileMap({ world }) {
+  const box = useRef(null);
+  const viewport = useViewport(box);
+  const { tiles } = world.map;
+
+  const known = useMemo(() => {
+    const at = new Map();
+    for (const tile of tiles) at.set(`${tile.x},${tile.y}`, tile);
+    return at;
+  }, [tiles]);
+
+  const actors = useMemo(() => {
+    const at = new Map();
+    for (const entity of world.entities) at.set(`${entity.x},${entity.y}`, entity);
+    return at;
+  }, [world.entities]);
+
+  // Centre on the player when localized, otherwise on the middle of whatever
+  // coverage exists, so an unlocalized attachment still shows its tiles.
+  const centre = useMemo(() => {
+    if (world.player.x !== null && world.player.y !== null) {
+      return { x: world.player.x, y: world.player.y };
+    }
+    if (!tiles.length) return { x: 0, y: 0 };
+    let sumX = 0, sumY = 0;
+    for (const tile of tiles) { sumX += tile.x; sumY += tile.y; }
+    return { x: Math.round(sumX / tiles.length), y: Math.round(sumY / tiles.length) };
+  }, [world.player.x, world.player.y, tiles]);
+
+  const originX = centre.x - (viewport.columns >> 1);
+  const originY = centre.y - (viewport.rows >> 1);
+  const cells = [];
+
+  for (let row = 0; row < viewport.rows; row += 1) {
+    for (let column = 0; column < viewport.columns; column += 1) {
+      const x = originX + column, y = originY + row;
+      const tile = known.get(`${x},${y}`);
+      const key = `${x},${y}`;
+
+      if (!tile) {
+        cells.push(h("div", { key, className: "cell void" }));
+        continue;
+      }
+
+      let className = "cell";
+      if (tile.pass !== 0) className += " blocked";
+      else if (tile.object !== 0) className += " fixture";
+
+      const actor = actors.get(key);
+      if (actor) className += actor.floor_item ? " item" : " entity";
+      if (world.player.x === x && world.player.y === y) className += " player";
+
+      const collision = tile.collision === null
+        ? ""
+        : ` collision=0x${tile.collision.toString(16).padStart(2, "0")}`;
+
+      cells.push(h("div", {
+        key,
+        className,
+        title: `${x},${y} ground=${tile.ground} pass=${tile.pass} object=${tile.object}${collision}`,
+      }));
+    }
+  }
+
+  // The title comes only from a `0x15` context, so a warm attachment that read
+  // its identity from client memory knows which map it is on without knowing
+  // what the server calls it. Say "unknown" rather than leave the panel blank.
+  const name = world.map.title ?? "unknown";
+
+  return h(Panel, {
+    title: "TILE MAP",
+    note: `${name} · ${tiles.length} tiles · centre ${centre.x},${centre.y}`,
+    grow: true,
+  },
+    h("div", { className: "mapbox", ref: box },
+      h("div", {
+        className: "grid",
+        style: { "--cols": viewport.columns, "--rows": viewport.rows },
+      }, cells)),
+    h("div", { className: "legend" },
+      h("span", null, h("b", { style: { background: "#12160f" } }), "open"),
+      h("span", null, h("b", { style: { background: "#3a2c29" } }), "blocked"),
+      h("span", null, h("b", { style: { background: "#2a2519" } }), "fixture"),
+      h("span", null, h("b", { style: { background: "#e0b25f" } }), "actor"),
+      h("span", null, h("b", { style: { background: "#4d564f" } }), "item"),
+      h("span", null, h("b", { style: { background: "#7fd6a3" } }), "player")));
+}
+
+// ── Tracing ────────────────────────────────────────────────────────────────
+
+function Tracing({ lines }) {
+  const box = useRef(null);
+  const pinned = useRef(true);
+
+  useEffect(() => {
+    const node = box.current;
+    if (node && pinned.current) node.scrollTop = node.scrollHeight;
+  }, [lines]);
+
+  const onScroll = () => {
+    const node = box.current;
+    if (node) pinned.current = node.scrollTop + node.clientHeight >= node.scrollHeight - 24;
+  };
+
+  return h(Panel, { title: "TRACING", note: "fmt::layer(stderr) + web::trace::Layer", style: { flex: "0 0 42%" } },
+    h("div", { className: "body log", ref: box, onScroll },
+      lines.length
+        ? lines.map((line, index) => h("div", { key: index, className: `line ${line.level.trim()}` },
+            h("time", null, `${(line.elapsed_ms / 1000).toFixed(1)}s`),
+            h("span", { className: "lvl" }, line.level.trim()),
+            h("span", { className: "msg" }, line.message, " ", h("em", null, line.target))))
+        : h("div", { className: "empty" }, "no tracing output yet")));
+}
+
+// ── Console ────────────────────────────────────────────────────────────────
+
+/// Subscribes to the engine's event stream.
+///
+/// `EventSource` reconnects on its own after the engine restarts, so the only
+/// state worth tracking here is whether a message has arrived recently.
+function useEngineStream() {
+  const [world, setWorld] = useState(null);
+  const [lines, setLines] = useState([]);
+  const [live, setLive] = useState(false);
+
+  useEffect(() => {
+    const source = new EventSource("/events");
+
+    source.addEventListener("world", (message) => {
+      setLive(true);
+      setWorld(JSON.parse(message.data));
+    });
+    source.addEventListener("trace", (message) => {
+      setLive(true);
+      setLines((previous) => {
+        const next = previous.concat(JSON.parse(message.data));
+        return next.length > LOG_LIMIT ? next.slice(next.length - LOG_LIMIT) : next;
+      });
+    });
+    source.onerror = () => setLive(false);
+
+    return () => source.close();
+  }, []);
+
+  return { world, lines, live };
+}
+
+const hex = (value, width) =>
+  value === null || value === undefined ? null : `0x${value.toString(16).padStart(width, "0")}`;
+
+const ratio = (current, maximum) =>
+  current !== null && current !== undefined && maximum ? Math.round((current / maximum) * 100) : 0;
+
+function Console() {
+  const { world, lines, live } = useEngineStream();
+
+  if (!world) {
+    return h("div", { className: "offline" },
+      live ? "Waiting for the first projection…" : "Not connected to an engine.");
+  }
+
+  const { map, player, packets, heartbeat } = world;
+  const coverage = Math.round(packets.coverage * 100);
+
+  return h("div", { style: { display: "contents" } },
+    h("header", null,
+      h("div", { className: "brand" }, "VIPERZOO", h("small", null, "engine console")),
+      h(Stat, { label: "REVISION", value: world.revision }),
+      h(Stat, { label: "EPOCH", value: `${map.epoch} ${map.origin}` }),
+      h(Stat, { label: "PACKETS", value: `${packets.processed}/${packets.unknown}` }),
+      h(Stat, { label: "COVERAGE", value: `${coverage}%` }),
+      h(Stat, { label: "HEARTBEAT", value: `${heartbeat.matched}/${heartbeat.challenges}` }),
+      h("div", { className: `badge ${live && world.connected ? "up" : "down"}` },
+        live && world.connected ? "ATTACHED" : "DISCONNECTED")),
+
+    h("main", null,
+      h("div", { className: "col" },
+        h(Panel, { title: "MAP" }, h("div", { className: "body" }, h(Rows, { pairs: [
+          ["id", hex(map.id, 4)],
+          ["title", map.title],
+          ["size", map.width === null ? null : `${map.width}×${map.height}`],
+          ["epoch", `${map.epoch} (${map.origin})`],
+          ["tiles", map.tiles.length],
+          ["blocked", map.blocked],
+        ] }))),
+        h(Panel, { title: "DECODER COVERAGE" }, h("div", { className: "body" },
+          h(Rows, { pairs: [["processed", packets.processed], ["unknown", packets.unknown]] }),
+          h(Meter, { kind: "", ratio: coverage }))),
+        h(Panel, { title: "ENTITIES", note: `${world.entities.length}`, grow: true },
+          h("div", { className: "body" }, h(List, {
+            empty: "none visible",
+            items: world.entities.map((entity) => h("li", { key: entity.id, className: "row" },
+              h("span", null, `#${entity.id}`),
+              h("b", null, `${entity.x},${entity.y}${entity.floor_item ? " item" : ""}${entity.blocking ? " ▪" : ""}`))),
+          })))),
+
+      h("div", { className: "col" },
+        h(TileMap, { world }),
+        h(Tracing, { lines })),
+
+      h("div", { className: "col" },
+        h(Panel, { title: "CHARACTER" }, h("div", { className: "body" },
+          h(Rows, { pairs: [
+            ["position", player.x === null ? null : `${player.x}, ${player.y}`],
+            ["level", player.level],
+            ["vita", player.vita === null ? null : `${player.vita} / ${player.vita_max ?? "—"}`],
+            ["mana", player.mana === null ? null : `${player.mana} / ${player.mana_max ?? "—"}`],
+            ["experience", player.experience],
+            ["money", player.money],
+            ["capacity", player.capacity],
+          ] }),
+          h(Meter, { kind: "vita", ratio: ratio(player.vita, player.vita_max) }),
+          h(Meter, { kind: "mana", ratio: ratio(player.mana, player.mana_max) }))),
+        h(Panel, { title: "EQUIPPED", note: `${world.equipment.length}` },
+          h("div", { className: "body" }, h(List, {
+            empty: "none observed",
+            items: world.equipment.map((item) => h("li", { key: item.slot, className: "row" },
+              h("span", null, item.slot), h("b", null, item.name))),
+          }))),
+        h(Panel, {
+          title: "INVENTORY",
+          note: player.capacity === null
+            ? `${world.inventory.length}`
+            : `${world.inventory.length} / ${player.capacity}`,
+          grow: true,
+        }, h("div", { className: "body" }, h(List, {
+          empty: "none observed",
+          items: world.inventory.map((item) => h("li", { key: item.slot, className: "row" },
+            h("span", null, `${item.slot} ${item.name}`), h("b", null, item.amount))),
+        }))),
+        h(Panel, { title: "MESSAGES", style: { flex: "0 0 26%" } },
+          h("div", { className: "body" }, h("ul", { className: "chat" },
+            world.messages.slice(-40).map((message, index) =>
+              h("li", { key: index }, message.text))))))));
+}
+
+createRoot(document.getElementById("root")).render(h(StrictMode, null, h(Console)));
+</script>
+</body>
+</html>

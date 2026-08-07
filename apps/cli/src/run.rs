@@ -84,6 +84,12 @@ fn drain_events(attachment: &frida::Attachment) {
                 capacity,
                 occupied, "carried inventory seeded from client memory"
             ),
+            Event::MapIdentitySeeded(identity) => info!(
+                map = identity.id().value(),
+                width = identity.dimensions().width(),
+                height = identity.dimensions().height(),
+                "map identity seeded from client memory"
+            ),
             Event::TransportClosed => {
                 warn!("NexusTK game transport closed below the plaintext packet boundary");
             }

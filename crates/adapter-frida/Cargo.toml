@@ -11,7 +11,7 @@ hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = [ "rt", "sync" ] }
+tokio = { workspace = true, features = [ "rt", "sync", "time" ] }
 tracing.workspace = true
 viperzoo-adapter-api = { version = "0.1.0", path = "../adapter-api" }
 viperzoo-engine = { version = "0.1.0", path = "../engine" }

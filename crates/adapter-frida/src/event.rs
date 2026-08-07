@@ -1,7 +1,7 @@
 //! Operational events emitted by the direct adapter boundary.
 
 use viperzoo_adapter_api::resource;
-use viperzoo_protocol::direction::Flow;
+use viperzoo_protocol::{direction::Flow, map};
 
 /// One direct-adapter lifecycle or diagnostic event.
 #[derive(Debug)]
@@ -12,6 +12,11 @@ pub enum Event {
     Ready(Info),
     /// A validated warm-attachment resource snapshot entered the engine.
     ResourcesSeeded(resource::Resources),
+    /// Map identity read from the client's own model entered the engine.
+    ///
+    /// A warm attachment joins after the `0x15` context has passed, so this is
+    /// what tells routing which map its coordinates belong to.
+    MapIdentitySeeded(map::Identity),
     /// A complete warm-attachment inventory snapshot entered the engine.
     InventorySeeded {
         /// Number of slots covered by the client scan.

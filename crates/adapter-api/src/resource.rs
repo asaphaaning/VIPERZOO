@@ -7,7 +7,27 @@
 
 use thiserror::Error;
 
-/// A validated current/maximum resource pair.
+/// A current/maximum resource pair that cannot be constructed incoherently.
+///
+/// Two readings of the same pool are only comparable if both are whole, so the
+/// pair is validated once at the boundary rather than re-checked by everything
+/// downstream. A client-memory read is the motivating case: it can catch the
+/// process mid-update and report a current value above the maximum, or a
+/// maximum of zero for a pool the character does not have. Either would project
+/// as a real observation if the pair were a plain struct.
+///
+/// ```
+/// use viperzoo_adapter_api::resource::Pool;
+///
+/// let vita = Pool::new(783, 783).expect("full pool is coherent");
+///
+/// assert_eq!(vita.current(), 783);
+/// assert_eq!(vita.maximum(), 783);
+///
+/// // A torn read cannot become a projected fact.
+/// assert!(Pool::new(900, 783).is_err());
+/// assert!(Pool::new(0, 0).is_err());
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Pool {
     current: u32,

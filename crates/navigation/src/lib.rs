@@ -10,10 +10,12 @@
 //! execute one safe step, receive more map data, and plan again without
 //! pretending unknown coordinates are globally traversable.
 
+mod avoidance;
 mod edge;
 mod planner;
 mod route;
 
+pub use avoidance::Avoidance;
 pub use edge::{Edge, Knowledge};
-pub use planner::{Error, plan, plan_with_assets};
+pub use planner::{Error, plan, plan_avoiding, plan_with_assets, plan_with_assets_avoiding};
 pub use route::{Plan, Route};

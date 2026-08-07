@@ -2,78 +2,161 @@
 //!
 //! A late attachment can observe tile rectangles before it receives a map
 //! context. [`State`] therefore represents that real uncertainty instead of
-//! pairing old coordinates with a guessed map identifier. Once context arrives,
-//! coverage and identity become one [`Epoch`]; a later identity change starts a
-//! fresh epoch so tiles from different maps cannot be silently merged.
+//! pairing old coordinates with a guessed map identifier. The first observed
+//! context starts a fresh [`Epoch`] because the client may have crossed a map
+//! boundary after attachment; later identity changes do the same. Tiles from
+//! different maps therefore cannot be silently merged.
+//!
+//! Both advances move the same counter, so the counter alone cannot say what
+//! happened. [`Epoch::origin`] carries that distinction to callers holding
+//! map-scoped work:
+//!
+//! ```text
+//! Unidentified ──first context──► Identified   Origin::Established
+//!                                     │        (we learned where we were)
+//!                                     │
+//!                                     └─new identity─► Identified
+//!                                                      Origin::Crossed
+//!                                                      (we are elsewhere)
+//! ```
 //!
 //! Navigation can use unidentified coverage only as a bounded local area. It
 //! may use identified coverage together with decoded map dimensions.
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use viperzoo_protocol::{map as protocol, primitive::Position};
 
-/// A monotonically increasing map identity epoch.
+/// How a map [`Epoch`] came to be.
+///
+/// Map-scoped work is planned against one epoch. When the epoch advances, this
+/// is what separates "we finally learned which map we were already on" from
+/// "we are standing somewhere else now". Both advance the counter, and they
+/// demand opposite recoveries, so the counter alone cannot decide.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct Epoch(u64);
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// No map identity has been observed since attachment.
+    ///
+    /// Coverage is provisional: it may serve as a bounded local area, but no
+    /// [`Context`] justifies a map-wide claim.
+    #[default]
+    Attachment,
+    /// Identity was first established for previously unidentified coverage.
+    ///
+    /// The player did not necessarily move. A warm attachment reaches this
+    /// origin on its first observed context, so a destination planned in the
+    /// previous epoch is stale rather than wrong about the world.
+    Established,
+    /// Identity replaced a different identified map.
+    ///
+    /// The player genuinely crossed a boundary, so a coordinate planned in the
+    /// previous epoch names a different place and must not be reused.
+    Crossed,
+}
+
+impl Origin {
+    /// Every [`Origin`], in declaration order.
+    pub const VARIANTS: [Self; 3] = [Self::Attachment, Self::Established, Self::Crossed];
+}
+
+/// A monotonically increasing map identity epoch and the event that began it.
+///
+/// The counter orders epochs; [`Epoch::origin`] explains the most recent
+/// advance. Both matter: comparing counters detects that map-scoped work is
+/// stale, and the [`Origin`] decides whether that work can be replanned or must
+/// be abandoned.
+///
+/// ```
+/// use viperzoo_world::map::{Epoch, Origin};
+///
+/// let attached = Epoch::ATTACHMENT;
+/// assert_eq!(attached.origin(), Origin::Attachment);
+///
+/// // A warm attachment learning where it already was.
+/// let identified = attached.established();
+/// assert_eq!(identified.value(), 1);
+/// assert_eq!(identified.origin(), Origin::Established);
+///
+/// // Walking through a portal into a different map.
+/// let elsewhere = identified.crossed();
+/// assert_eq!(elsewhere.value(), 2);
+/// assert_eq!(elsewhere.origin(), Origin::Crossed);
+///
+/// // Both advanced the counter; only the origin says which happened.
+/// assert_ne!(identified.origin(), elsewhere.origin());
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Epoch {
+    value: u64,
+    origin: Origin,
+}
 
 impl Epoch {
-    /// Returns the following map epoch.
+    /// The epoch of an attachment that has not yet observed map identity.
+    pub const ATTACHMENT: Self = Self {
+        value: 0,
+        origin: Origin::Attachment,
+    };
+
+    /// Returns the epoch beginning when identity first arrives for coverage
+    /// that had none, yielding [`Origin::Established`].
     #[must_use]
-    pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+    pub const fn established(self) -> Self {
+        Self {
+            value: self.value + 1,
+            origin: Origin::Established,
+        }
+    }
+
+    /// Returns the epoch beginning when identity replaces a different known
+    /// map, yielding [`Origin::Crossed`].
+    #[must_use]
+    pub const fn crossed(self) -> Self {
+        Self {
+            value: self.value + 1,
+            origin: Origin::Crossed,
+        }
     }
 
     /// Returns the numeric epoch.
     #[must_use]
     pub const fn value(self) -> u64 {
-        self.0
+        self.value
+    }
+
+    /// Returns how this epoch began.
+    #[must_use]
+    pub const fn origin(self) -> Origin {
+        self.origin
     }
 }
 
-/// Map context without packet-boundary workspace bytes.
+/// Serializes as the bare counter, so projections keep their numeric shape.
+impl Serialize for Epoch {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(self.value)
+    }
+}
+
+/// Surroundings the server describes alongside map identity.
+///
+/// Only a `0x15` context carries these. Client memory publishes which map is
+/// active without describing it, so [`Context::environment`] is absent for a
+/// memory-derived identity rather than defaulted to zeroes that would read as
+/// real observations.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct Context {
-    id: viperzoo_protocol::primitive::MapId,
-    dimensions: protocol::Dimensions,
+pub struct Environment {
     weather: u8,
     realm: u8,
-    title: String,
     light: u16,
 }
 
-impl Context {
-    fn from_protocol(context: &protocol::Context) -> Self {
-        Self {
-            id: context.id(),
-            dimensions: context.dimensions(),
-            weather: context.weather(),
-            realm: context.realm(),
-            title: context.title().to_owned(),
-            light: context.light(),
-        }
-    }
-
-    /// Returns the stable map identifier.
-    #[must_use]
-    pub const fn id(&self) -> viperzoo_protocol::primitive::MapId {
-        self.id
-    }
-
-    /// Returns the full map dimensions.
-    #[must_use]
-    pub const fn dimensions(&self) -> protocol::Dimensions {
-        self.dimensions
-    }
-
-    /// Returns the display title.
-    #[must_use]
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
+impl Environment {
     /// Returns the weather value.
     #[must_use]
     pub const fn weather(&self) -> u8 {
@@ -91,9 +174,94 @@ impl Context {
     pub const fn light(&self) -> u16 {
         self.light
     }
+}
+
+/// Map context without packet-boundary workspace bytes.
+///
+/// Identity is always present; [`Environment`] is present only when the server
+/// described the map. The two sources differ in what they can know, not in how
+/// much they are trusted for identity:
+///
+/// ```text
+/// 0x15 context   ──►  Identity + Environment
+/// client memory  ──►  Identity
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Context {
+    #[serde(flatten)]
+    identity: protocol::Identity,
+    /// Both sources can name the map, so the title is its own field rather than
+    /// part of [`Environment`]: a warm attachment reads it from the client's own
+    /// model without learning anything about the weather.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Flattened so a described map keeps its established projection shape and
+    /// an undescribed one simply omits those keys, rather than reporting
+    /// zeroes that would read as real weather, realm, and light observations.
+    #[serde(flatten)]
+    environment: Option<Environment>,
+}
+
+impl Context {
+    fn from_protocol(context: &protocol::Context) -> Self {
+        Self {
+            identity: context.identity(),
+            title: Some(context.title().to_owned()),
+            environment: Some(Environment {
+                weather: context.weather(),
+                realm: context.realm(),
+                light: context.light(),
+            }),
+        }
+    }
+
+    /// Builds context from what a warm attachment can read out of the client.
+    ///
+    /// The client keeps identity and title in different places — identity on
+    /// the map model, the title on the object published beside the resource
+    /// model — and neither carries the weather. `title` is therefore optional
+    /// independently of identity, and [`Environment`] stays absent entirely.
+    #[must_use]
+    pub const fn from_identity(identity: protocol::Identity, title: Option<String>) -> Self {
+        Self {
+            identity,
+            title,
+            environment: None,
+        }
+    }
+
+    /// Returns the stable map identifier.
+    #[must_use]
+    pub const fn id(&self) -> viperzoo_protocol::primitive::MapId {
+        self.identity.id()
+    }
+
+    /// Returns the full map dimensions.
+    #[must_use]
+    pub const fn dimensions(&self) -> protocol::Dimensions {
+        self.identity.dimensions()
+    }
+
+    /// Returns the identity this context establishes.
+    #[must_use]
+    pub const fn identity(&self) -> protocol::Identity {
+        self.identity
+    }
+
+    /// Returns the server-described surroundings, when the server described them.
+    #[must_use]
+    pub const fn environment(&self) -> Option<&Environment> {
+        self.environment.as_ref()
+    }
+
+    /// Returns the display title, from whichever source supplied one.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
 
     fn same_identity(&self, other: &Self) -> bool {
-        self.id == other.id && self.dimensions == other.dimensions
+        self.identity == other.identity
     }
 }
 
@@ -166,7 +334,7 @@ pub(crate) enum State {
 impl Default for State {
     fn default() -> Self {
         Self::Unidentified {
-            epoch: Epoch::default(),
+            epoch: Epoch::ATTACHMENT,
             tiles: BTreeMap::new(),
         }
     }
@@ -178,11 +346,11 @@ impl State {
         let previous = std::mem::take(self);
 
         match previous {
-            Self::Unidentified { epoch, tiles } => {
+            Self::Unidentified { epoch, .. } => {
                 *self = Self::Identified {
-                    epoch: epoch.next(),
+                    epoch: epoch.established(),
                     context: observed,
-                    tiles,
+                    tiles: BTreeMap::new(),
                 };
 
                 Transition::Identified
@@ -208,13 +376,45 @@ impl State {
             }
             Self::Identified { epoch, .. } => {
                 *self = Self::Identified {
-                    epoch: epoch.next(),
+                    epoch: epoch.crossed(),
                     context: observed,
                     tiles: BTreeMap::new(),
                 };
 
                 Transition::Changed
             }
+        }
+    }
+
+    /// Establishes identity read from the client's own model.
+    ///
+    /// A warm attachment joins a client that has already been told where it is,
+    /// so the `0x15` context that would answer the question has long passed.
+    /// The client keeps the answer to render, and this accepts that reading —
+    /// but only to fill a gap. A context the server actually sent describes the
+    /// map as well as naming it, so it always wins:
+    ///
+    /// ```text
+    /// Unidentified            ──► Identified (Established)
+    /// Identified, same map    ──► unchanged, environment preserved
+    /// Identified, other map   ──► unchanged; the server's word stands
+    /// ```
+    pub(crate) fn observe_identity(
+        &mut self,
+        observed: protocol::Identity,
+        title: Option<String>,
+    ) -> Transition {
+        match self {
+            Self::Unidentified { epoch, .. } => {
+                *self = Self::Identified {
+                    epoch: epoch.established(),
+                    context: Context::from_identity(observed, title),
+                    tiles: BTreeMap::new(),
+                };
+
+                Transition::Identified
+            }
+            Self::Identified { .. } => Transition::Unchanged,
         }
     }
 
@@ -241,11 +441,11 @@ impl State {
     /// ```
     ///
     /// Region data does not establish or change map identity. It can be
-    /// accepted while the attachment is [`State::Unidentified`], and it is
-    /// scoped to a new map only when [`State::observe_context`] records an
-    /// identity change and clears the old coverage. The returned value says
-    /// whether the projected coverage changed, not whether the packet was
-    /// merely observed.
+    /// accepted while the attachment is [`State::Unidentified`]. Because that
+    /// provisional coverage has no identity, [`State::observe_context`] starts
+    /// a fresh epoch and clears it when the first context arrives. The returned
+    /// value says whether the projected coverage changed, not whether the
+    /// packet was merely observed.
     pub(crate) fn merge(&mut self, region: &protocol::Region) -> bool {
         let tiles = match self {
             Self::Unidentified { tiles, .. } | Self::Identified { tiles, .. } => tiles,
@@ -306,7 +506,7 @@ impl Transition {
     }
 
     pub(crate) const fn invalidates_scoped_state(self) -> bool {
-        matches!(self, Self::Changed)
+        matches!(self, Self::Identified | Self::Changed)
     }
 }
 

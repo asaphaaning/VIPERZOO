@@ -40,6 +40,9 @@ impl Reducer {
             Observation::Packet(packet) => self.world.apply(&packet),
             Observation::PlayerResources(resources) => self.world.seed_resources(resources),
             Observation::PlayerInventory(inventory) => self.world.seed_inventory(&inventory),
+            Observation::ClientMap { identity, title } => {
+                self.world.seed_map_identity(identity, title)
+            }
         }
     }
 
@@ -57,6 +60,7 @@ const fn observation_name(observation: &Observation) -> &'static str {
         Observation::Packet(_) => "packet",
         Observation::PlayerResources(_) => "player-resources",
         Observation::PlayerInventory(_) => "player-inventory",
+        Observation::ClientMap { .. } => "client-map",
     }
 }
 

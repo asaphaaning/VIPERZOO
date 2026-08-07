@@ -40,6 +40,13 @@ pub enum Action {
     Interact(EntityId),
     /// Submit one validated NPC dialog selection through client opcode `0x39`.
     Dialog(DialogSelection),
+    /// Submit an interaction and its ordered selections as one response-gated
+    /// dialog transaction.
+    ///
+    /// The selections are all addressed to the transaction's entity. Adapters
+    /// preserve their order across client-owned transport boundaries and do
+    /// not advance response-dependent selections before the server dialog.
+    DialogTransaction(DialogTransaction),
     /// Send one validated public speech line through client opcode `0x0E`.
     Speak(Speech),
     /// Select one map from an already-open native client travel menu.
@@ -144,6 +151,60 @@ impl DialogSelection {
     }
 }
 
+/// One ordered NPC interaction and its follow-up menu selections.
+///
+/// A dialog transaction begins with client opcode `0x43` and continues with
+/// one or more `0x39` selections. [`DialogTransaction::new`] requires every
+/// selection to target the same entity, making it impossible to enqueue an
+/// interleaved conversation through this action. Adapters pace the interaction
+/// and gate later selections on the matching server dialog response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DialogTransaction {
+    entity: EntityId,
+    selections: Box<[DialogSelection]>,
+}
+
+impl DialogTransaction {
+    /// Creates one non-empty, entity-consistent dialog transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DialogTransactionEmpty`] when no selection is supplied
+    /// or [`Error::DialogTransactionEntity`] when a selection targets another
+    /// entity.
+    pub fn new(
+        entity: EntityId,
+        selections: impl IntoIterator<Item = DialogSelection>,
+    ) -> Result<Self, Error> {
+        let selections = selections.into_iter().collect::<Box<[_]>>();
+
+        if selections.is_empty() {
+            return Err(Error::DialogTransactionEmpty);
+        }
+
+        if selections
+            .iter()
+            .any(|selection| selection.entity() != entity)
+        {
+            return Err(Error::DialogTransactionEntity);
+        }
+
+        Ok(Self { entity, selections })
+    }
+
+    /// Returns the NPC that owns this interaction and every selection.
+    #[must_use]
+    pub const fn entity(&self) -> EntityId {
+        self.entity
+    }
+
+    /// Borrows the selections in their required transport order.
+    #[must_use]
+    pub fn selections(&self) -> &[DialogSelection] {
+        &self.selections
+    }
+}
+
 /// One bounded ASCII speech line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Speech {
@@ -184,6 +245,158 @@ impl Speech {
     #[must_use]
     pub fn text(&self) -> &[u8] {
         &self.text
+    }
+}
+
+/// How many units a shop or bank [`Command`] applies to.
+///
+/// The three forms are distinct grammar, not a count with special values, so
+/// they are variants rather than a `u16` where `0` would have to mean "all".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Quantity {
+    /// A single unit, rendered as the bare command form.
+    #[default]
+    One,
+    /// An explicit count, rendered as a trailing `number (count)`.
+    Exactly(u16),
+    /// Every unit the shop or bank will accept, rendered as a leading `all`.
+    All,
+}
+
+impl Quantity {
+    /// Every [`Quantity`], in declaration order.
+    pub const VARIANTS: [Self; 3] = [Self::One, Self::Exactly(1), Self::All];
+}
+
+/// A spoken shop or bank command the server parses from ordinary speech.
+///
+/// These lines are public speech that the server interprets as transactions.
+/// All four operations share one grammar, which is why they are one type:
+///
+/// ```text
+/// <prefix> [all] <item> [number <count>] [suffix]
+/// ```
+///
+/// Rendering them from a closed vocabulary keeps the exact wording in one
+/// place and makes the quantity forms reachable without re-deriving their
+/// syntax at each call site.
+///
+/// # Evidence
+///
+/// The wording follows community documentation of the live command set, not
+/// packets captured from this server. A rendered command is therefore a
+/// *candidate*: callers must confirm the effect through authoritative
+/// inventory or bank projection, because dispatching speech is never evidence
+/// that a transaction completed.
+///
+/// ```
+/// use viperzoo_adapter_api::action::{Command, Quantity};
+///
+/// assert_eq!(
+///     Command::Buy { item: "Axe", quantity: Quantity::Exactly(3) }.line(),
+///     "I buy Axe number 3"
+/// );
+/// assert_eq!(
+///     Command::Buy { item: "Axe", quantity: Quantity::One }.line(),
+///     "I buy Axe"
+/// );
+/// assert_eq!(
+///     Command::Deposit { item: "Ginko wood", quantity: Quantity::All }.line(),
+///     "I will deposit all Ginko wood"
+/// );
+/// assert_eq!(
+///     Command::Withdraw { item: "Yellow scroll", quantity: Quantity::Exactly(2) }.line(),
+///     "Give my Yellow scroll number 2 back"
+/// );
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Command<'a> {
+    /// Purchase from a shop keeper.
+    Buy {
+        /// Item name as the server spells it.
+        item: &'a str,
+        /// How many units to request.
+        quantity: Quantity,
+    },
+    /// Sell to a shop keeper, whose command reads from their perspective.
+    Sell {
+        /// Item name as the server spells it.
+        item: &'a str,
+        /// How many units to offer.
+        quantity: Quantity,
+    },
+    /// Store items with a bank attendant.
+    Deposit {
+        /// Item name as the server spells it.
+        item: &'a str,
+        /// How many units to store.
+        quantity: Quantity,
+    },
+    /// Reclaim stored items from a bank attendant.
+    Withdraw {
+        /// Item name as the server spells it.
+        item: &'a str,
+        /// How many units to reclaim.
+        quantity: Quantity,
+    },
+}
+
+impl Command<'_> {
+    /// Returns the command's leading words and any trailing word.
+    const fn frame(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Buy { .. } => ("I buy", ""),
+            Self::Sell { .. } => ("Buy my", ""),
+            Self::Deposit { .. } => ("I will deposit", ""),
+            Self::Withdraw { .. } => ("Give my", "back"),
+        }
+    }
+
+    /// Returns the item and quantity this command applies to.
+    const fn subject(&self) -> (&str, Quantity) {
+        match self {
+            Self::Buy { item, quantity }
+            | Self::Sell { item, quantity }
+            | Self::Deposit { item, quantity }
+            | Self::Withdraw { item, quantity } => (item, *quantity),
+        }
+    }
+
+    /// Renders the command as the line a player would speak.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let (prefix, suffix) = self.frame();
+        let (item, quantity) = self.subject();
+        let mut line = String::from(prefix);
+
+        if matches!(quantity, Quantity::All) {
+            line.push_str(" all");
+        }
+
+        line.push(' ');
+        line.push_str(item);
+
+        if let Quantity::Exactly(count) = quantity {
+            line.push_str(" number ");
+            line.push_str(&count.to_string());
+        }
+
+        if !suffix.is_empty() {
+            line.push(' ');
+            line.push_str(suffix);
+        }
+
+        line
+    }
+
+    /// Renders the command as validated public speech.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an item name that would produce empty, non-ASCII,
+    /// NUL-containing, or over-255-byte speech.
+    pub fn speak(&self) -> Result<Speech, Error> {
+        Speech::say(&self.line())
     }
 }
 
@@ -326,6 +539,12 @@ pub enum Error {
     /// Shop quantities are non-zero.
     #[error("dialog quantity must be non-zero")]
     DialogQuantity,
+    /// A dialog transaction must include at least one selection.
+    #[error("dialog transaction must include at least one selection")]
+    DialogTransactionEmpty,
+    /// Every dialog transaction selection must target its interaction entity.
+    #[error("dialog transaction selections must target the interaction entity")]
+    DialogTransactionEntity,
     /// Speech uses one non-empty ASCII u8-length field.
     #[error("speech text must be 1..=255 ASCII bytes without NUL")]
     SpeechText,
@@ -372,6 +591,35 @@ mod tests {
                 .quantity(),
             Some(2)
         );
+    }
+
+    #[test]
+    fn dialog_transaction_is_non_empty_and_entity_consistent() {
+        let attendant = EntityId::new(0x2e78);
+        let stranger = EntityId::new(0x2c08);
+
+        assert_eq!(
+            DialogTransaction::new(attendant, []),
+            Err(Error::DialogTransactionEmpty)
+        );
+        assert_eq!(
+            DialogTransaction::new(attendant, [DialogSelection::option(stranger, 0x40)]),
+            Err(Error::DialogTransactionEntity)
+        );
+
+        let transaction = DialogTransaction::new(
+            attendant,
+            [
+                DialogSelection::option(attendant, 0x40),
+                DialogSelection::text(attendant, 0x4a, "Yellow scroll")
+                    .expect("captured item name is valid"),
+            ],
+        )
+        .expect("all selections target the attendant");
+
+        assert_eq!(transaction.entity(), attendant);
+        assert_eq!(transaction.selections().len(), 2);
+        assert_eq!(transaction.selections()[1].command(), 0x4a);
     }
 
     #[test]

@@ -97,7 +97,8 @@ enum Map<'a> {
     Identified {
         epoch: u64,
         id: u16,
-        title: &'a str,
+        /// Absent when identity came from client memory rather than `0x15`.
+        title: Option<&'a str>,
         width: u16,
         height: u16,
         known_tiles: usize,

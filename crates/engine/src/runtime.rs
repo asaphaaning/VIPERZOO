@@ -221,6 +221,7 @@ const fn observation_name(observation: &Observation) -> &'static str {
         Observation::Packet(_) => "packet",
         Observation::PlayerResources(_) => "player-resources",
         Observation::PlayerInventory(_) => "player-inventory",
+        Observation::ClientMap { .. } => "client-map",
     }
 }
 

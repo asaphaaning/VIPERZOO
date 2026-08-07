@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use tracing::instrument;
 use viperzoo_adapter_api::{inventory as adapter_inventory, resource};
-use viperzoo_protocol::{client, packet, server};
+use viperzoo_protocol::{client, map as protocol, packet, server};
 
 use crate::{
     action, entity, inventory, map, player,
@@ -25,6 +25,27 @@ use crate::{
 };
 
 /// The effect of recording one decoded packet.
+///
+/// Both variants advance the [`Revision`]; they differ in whether a script
+/// watching the world would see anything new. Collapsing them into a boolean
+/// would lose exactly the distinction a subscriber needs — re-rendering on every
+/// heartbeat is waste, and treating a quiet engine as a stalled one is a bug.
+///
+/// ```text
+/// heartbeat pong      ──► Recorded   evidence advanced, projection identical
+/// player stepped      ──► Projected  a script-visible fact changed
+/// ```
+///
+/// ```
+/// use viperzoo_world::world::{Change, World};
+/// use viperzoo_world::revision::Revision;
+///
+/// let mut world = World::new();
+/// let change = world.observe_transport_close();
+///
+/// assert!(change.is_projected());
+/// assert!(change.revision() > Revision::INITIAL);
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Change {
     /// Ordering/evidence changed without changing a projected domain facet.
@@ -101,6 +122,35 @@ impl World {
             Change::Projected(revision)
         } else {
             Change::Recorded(revision)
+        }
+    }
+
+    /// Establishes map identity read from the client's own model.
+    ///
+    /// A warm attachment misses the `0x15` context that names the map, leaving
+    /// routing to infer position without knowing which map the coordinates
+    /// belong to. This fills that gap only: an identity the server described is
+    /// never replaced by one read from memory.
+    #[instrument(
+        name = "viperzoo::world::seed_map_identity",
+        skip(self),
+        fields(map = identity.id().value()),
+        ret(level = "debug")
+    )]
+    pub fn seed_map_identity(
+        &mut self,
+        identity: protocol::Identity,
+        title: Option<String>,
+    ) -> Change {
+        let revision = self.revision.next();
+        let transition = self.map.observe_identity(identity, title);
+
+        self.revision = revision;
+
+        if matches!(transition, map::Transition::Unchanged) {
+            Change::Recorded(revision)
+        } else {
+            Change::Projected(revision)
         }
     }
 
@@ -445,7 +495,8 @@ mod tests {
         let resources = snapshot.player().resources();
 
         assert_eq!(snapshot.map().epoch().value(), 1);
-        assert_eq!(context.title(), "Welcome");
+        assert_eq!(snapshot.map().epoch().origin(), map::Origin::Established);
+        assert_eq!(context.title(), Some("Welcome"));
         assert_eq!(
             snapshot.player().location().position(),
             Some(Position::new(3, 1))
@@ -506,9 +557,56 @@ mod tests {
         let snapshot = world.snapshot();
 
         assert_eq!(snapshot.map().epoch().value(), 2);
+        assert_eq!(snapshot.map().epoch().origin(), map::Origin::Crossed);
         assert!(snapshot.map().tiles().is_empty());
         assert!(snapshot.entities().is_empty());
         assert!(snapshot.player().location().position().is_none());
+    }
+
+    /// A warm attachment learning its own identity and a genuine crossing both
+    /// advance the epoch counter. Map-scoped work recovers differently from
+    /// each, so the projection must keep them distinguishable.
+    #[test]
+    fn first_identity_and_later_crossing_are_distinguishable() {
+        let mut warm = World::new();
+
+        assert_eq!(
+            warm.snapshot().map().epoch().origin(),
+            map::Origin::Attachment
+        );
+
+        // Tiles before any context: provisional coverage.
+        apply_hex(
+            &mut warm,
+            "0600000b000e0102003b0000038a002e000100000b030b00",
+        );
+        assert_eq!(
+            warm.snapshot().map().epoch().origin(),
+            map::Origin::Attachment
+        );
+
+        // The first `0x15` proves which map that coverage belonged to.
+        apply_hex(
+            &mut warm,
+            "1512670011001105000757656c636f6d6500e80002020200",
+        );
+
+        let identified = warm.snapshot().map().epoch();
+
+        assert_eq!(identified.value(), 1);
+        assert_eq!(identified.origin(), map::Origin::Established);
+
+        // A second, different identity is the player actually moving.
+        apply_hex(
+            &mut warm,
+            "15014c001e000e04000d537072696e672054617665726e00840002020000",
+        );
+
+        let crossed = warm.snapshot().map().epoch();
+
+        assert_eq!(crossed.value(), 2);
+        assert_eq!(crossed.origin(), map::Origin::Crossed);
+        assert_ne!(identified.origin(), crossed.origin());
     }
 
     #[test]
@@ -642,6 +740,47 @@ mod tests {
         assert!(snapshot.map().context().is_none());
         assert!(snapshot.player().location().position().is_none());
         assert_eq!(snapshot.processed_packet_count(), 0);
+    }
+
+    #[test]
+    fn first_map_identity_invalidates_warm_scoped_state() {
+        let mut world = World::new();
+
+        apply_hex(&mut world, "040015000c0015000c00410000");
+        apply_hex(
+            &mut world,
+            "0600000b000e0102003b0000038a002e000100000b030b00",
+        );
+
+        let warm = world.snapshot();
+        assert!(warm.map().context().is_none());
+        assert_eq!(
+            warm.player().location().position(),
+            Some(Position::new(21, 12))
+        );
+        assert!(!warm.map().tiles().is_empty());
+
+        apply_hex(&mut world, "15014a0092009c040004427579610206005eb40000");
+
+        let identified = world.snapshot();
+        assert_eq!(
+            identified
+                .map()
+                .context()
+                .expect("Buya context")
+                .id()
+                .value(),
+            0x014a
+        );
+        assert!(identified.player().location().position().is_none());
+        assert!(identified.map().tiles().is_empty());
+
+        apply_hex(&mut world, "04002e0069002e006900410000");
+
+        assert_eq!(
+            world.snapshot().player().location().position(),
+            Some(Position::new(46, 105))
+        );
     }
 
     #[test]

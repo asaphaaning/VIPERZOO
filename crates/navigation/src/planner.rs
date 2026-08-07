@@ -10,6 +10,12 @@
 //! limited to that coverage plus a one-tile acquisition halo. A distant target
 //! yields [`crate::Plan::Frontier`] rather than an unbounded route through
 //! imagined unknown space.
+//!
+//! A refusal is an ordinary answer here, not a fault. Callers replan after
+//! every step and turn [`enum@Error`] into learned edges or an alternative
+//! approach tile, so these spans record their error dimension at `debug`.
+//! Whether a refusal is worth an operator's attention is the caller's
+//! judgement, and only the caller has the context to make it.
 
 use std::{
     cmp::Ordering,
@@ -22,7 +28,7 @@ use viperzoo_assets::Catalog;
 use viperzoo_protocol::{direction::Direction, entity::Occupancy, primitive::Position};
 use viperzoo_world::snapshot::Snapshot;
 
-use crate::{Edge, Knowledge, Plan, Route};
+use crate::{Avoidance, Edge, Knowledge, Plan, Route};
 
 /// Plans from the projected player position to `target`.
 ///
@@ -42,11 +48,36 @@ use crate::{Edge, Knowledge, Plan, Route};
     name = "viperzoo::navigation::plan",
     skip(snapshot, knowledge),
     fields(target_x = target.x().value(), target_y = target.y().value()),
-    err,
+    err(level = "debug"),
     ret(level = "trace")
 )]
 pub fn plan(snapshot: &Snapshot, knowledge: &Knowledge, target: Position) -> Result<Plan, Error> {
-    plan_with(snapshot, knowledge, None, target)
+    plan_avoiding(snapshot, knowledge, &Avoidance::new(), target)
+}
+
+/// Plans while excluding route-local semantic boundaries.
+///
+/// Unlike collision, an [`Avoidance`] does not describe the map itself. It is
+/// supplied by the caller for a single route, for example to preserve a known
+/// portal tile until an explicit portal-crossing transaction selects it.
+///
+/// # Errors
+///
+/// Returns the same [`enum@Error`] vocabulary as [`plan`].
+#[instrument(
+    name = "viperzoo::navigation::plan_avoiding",
+    skip(snapshot, knowledge, avoidance),
+    fields(target_x = target.x().value(), target_y = target.y().value()),
+    err(level = "debug"),
+    ret(level = "trace")
+)]
+pub fn plan_avoiding(
+    snapshot: &Snapshot,
+    knowledge: &Knowledge,
+    avoidance: &Avoidance,
+    target: Position,
+) -> Result<Plan, Error> {
+    plan_with(snapshot, knowledge, avoidance, None, target)
 }
 
 /// Plans while joining streamed map object identifiers with static client
@@ -59,7 +90,7 @@ pub fn plan(snapshot: &Snapshot, knowledge: &Knowledge, target: Position) -> Res
     name = "viperzoo::navigation::plan_with_assets",
     skip(snapshot, knowledge, assets),
     fields(target_x = target.x().value(), target_y = target.y().value()),
-    err,
+    err(level = "debug"),
     ret(level = "trace")
 )]
 pub fn plan_with_assets(
@@ -68,12 +99,35 @@ pub fn plan_with_assets(
     assets: &Catalog,
     target: Position,
 ) -> Result<Plan, Error> {
-    plan_with(snapshot, knowledge, Some(assets), target)
+    plan_with_assets_avoiding(snapshot, knowledge, assets, &Avoidance::new(), target)
+}
+
+/// Plans with fixture collision while excluding route-local semantic boundaries.
+///
+/// # Errors
+///
+/// Returns the same [`enum@Error`] vocabulary as [`plan_with_assets`].
+#[instrument(
+    name = "viperzoo::navigation::plan_with_assets_avoiding",
+    skip(snapshot, knowledge, assets, avoidance),
+    fields(target_x = target.x().value(), target_y = target.y().value()),
+    err(level = "debug"),
+    ret(level = "trace")
+)]
+pub fn plan_with_assets_avoiding(
+    snapshot: &Snapshot,
+    knowledge: &Knowledge,
+    assets: &Catalog,
+    avoidance: &Avoidance,
+    target: Position,
+) -> Result<Plan, Error> {
+    plan_with(snapshot, knowledge, avoidance, Some(assets), target)
 }
 
 fn plan_with(
     snapshot: &Snapshot,
     knowledge: &Knowledge,
+    avoidance: &Avoidance,
     assets: Option<&Catalog>,
     target: Position,
 ) -> Result<Plan, Error> {
@@ -90,7 +144,11 @@ fn plan_with(
 
     let goal = bounds.goal(target)?;
 
-    if goal.is_target() && (blocked_tile(snapshot, target) || occupied(snapshot, target)) {
+    if goal.is_target()
+        && (avoidance.avoids(target)
+            || blocked_tile(snapshot, target)
+            || occupied(snapshot, target))
+    {
         return Err(Error::TargetBlocked(target));
     }
 
@@ -119,6 +177,7 @@ fn plan_with(
 
             if knowledge.is_blocked(edge)
                 || !bounds.contains(destination)
+                || avoidance.avoids(destination)
                 || blocked_tile(snapshot, destination)
                 || blocked_fixture(snapshot, assets, destination, direction)
                 || occupied(snapshot, destination)
@@ -407,7 +466,7 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use viperzoo_assets::{Catalog, Fixture};
+    use viperzoo_assets::{Catalog, Collision, Fixture, Metadata};
     use viperzoo_protocol::{decode, direction::Flow};
     use viperzoo_world::world::World;
 
@@ -467,7 +526,12 @@ mod tests {
         apply(&mut world, "04000600100006001000410000");
         apply(&mut world, "06000006000f010100000000033e");
         let catalog = Catalog::new(
-            [Fixture::new(830, vec![1878, 1874, 1871], [0; 5], 0x01)],
+            [Fixture::new(
+                830,
+                vec![1878, 1874, 1871],
+                Metadata::default(),
+                Collision::new(0x01),
+            )],
             "fixture-tile.dat".into(),
         );
         let Plan::Route(route) = plan_with_assets(
@@ -515,5 +579,32 @@ mod tests {
 
         assert_eq!(route.len(), 1);
         assert_eq!(route.first(), Some(Direction::Right));
+    }
+
+    #[test]
+    fn route_avoids_a_semantic_portal_tile() {
+        let mut world = World::new();
+        apply(
+            &mut world,
+            "1503ea00dc00dc04000a57696c6465726e657373020600b7598d00",
+        );
+        apply(&mut world, "04007600cf0008000dd91b0000");
+
+        let portal = Position::new(117, 207);
+        let Plan::Route(route) = plan_avoiding(
+            &world.snapshot(),
+            &Knowledge::new(),
+            &Avoidance::new().with_position(portal),
+            Position::new(110, 178),
+        )
+        .expect("a route around the portal exists") else {
+            panic!("target differs from origin");
+        };
+
+        let mut position = Position::new(118, 207);
+        for direction in route {
+            position = position.step(direction).expect("route remains in bounds");
+            assert_ne!(position, portal);
+        }
     }
 }

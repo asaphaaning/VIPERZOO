@@ -26,6 +26,32 @@ pub enum Source {
 }
 
 /// A value that is either unobserved or accompanied by coherent evidence.
+///
+/// `Option<T>` says whether a value exists; it cannot say why, or whether the
+/// next observation should replace it. That matters here because two sources
+/// disagree in kind: the server's packets are authoritative, while a warm
+/// attachment's client-memory read is a stopgap that must never overwrite them.
+/// Carrying the [`Revision`] and [`Source`] alongside the value keeps that rule
+/// in one place instead of repeating it at every assignment.
+///
+/// ```text
+/// Unknown                          nothing observed this epoch
+///   └─ observe(memory)  ──►  Observed { value, revision, ClientMemoryBuild752 }
+///        └─ observe(packet) ──►  Observed { value, revision, PlayerStatus }
+///             └─ observe(memory) ──►  unchanged: packets outrank memory
+/// ```
+///
+/// ```
+/// use viperzoo_world::knowledge::{Knowledge, Source};
+/// use viperzoo_world::revision::Revision;
+///
+/// let unknown: Knowledge<u32> = Knowledge::Unknown;
+/// assert_eq!(unknown.value(), None);
+///
+/// let seeded = Knowledge::observed(783, Revision::INITIAL.next(), Source::ClientMemoryBuild752);
+/// assert_eq!(seeded.value(), Some(&783));
+/// assert_eq!(seeded.source(), Some(Source::ClientMemoryBuild752));
+/// ```
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Knowledge<T> {

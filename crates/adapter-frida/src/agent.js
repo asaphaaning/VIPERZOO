@@ -97,6 +97,246 @@ function readClientResources() {
   }
 }
 
+function readClientMapContext() {
+  // Build 752 keeps the active map on the object published through RVA
+  // 0x27a764. The incoming `0x15` handler (RVA 0x1104d0, reached from the
+  // dispatcher at RVA 0x107c90) writes identity and dimensions together:
+  //
+  //   mov [esi+0x3F2], bx   ; map identity
+  //   mov [esi+0x3F4], di   ; width
+  //   mov [esi+0x3F6], ax   ; height
+  //
+  // and guards the reload by comparing all three, which is what makes the
+  // triple a checkable unit rather than a bare number. Every caller of the
+  // accessor at RVA 0x109470 loads the object from that one slot, so the
+  // path below is the client's own. The accessor bytes are verified first,
+  // so a changed executable yields Unknown instead of a wrong map.
+  const accessor = mainModule.base.add(0x00109470);
+  const accessorSignature = [0x0f, 0xb7, 0x81, 0xf2, 0x03, 0x00, 0x00, 0xc3];
+
+  try {
+    if (!matchesBytes(accessor, accessorSignature)) {
+      return { state: 'unknown', reason: 'client map accessor signature mismatch' };
+    }
+
+    const model = mainModule.base.add(0x0027a764).readPointer();
+
+    if (model.isNull()) {
+      return { state: 'unknown', reason: 'client map model is not initialized' };
+    }
+
+    const range = Process.findRangeByAddress(model);
+
+    if (range === null || !range.protection.includes('r') ||
+        model.add(0x3f8).compare(range.base.add(range.size)) >= 0) {
+      return { state: 'unknown', reason: 'client map model is not fully readable' };
+    }
+
+    const id = model.add(0x3f2).readU16();
+    const width = model.add(0x3f4).readU16();
+    const height = model.add(0x3f6).readU16();
+
+    // A map the client can render has both extents; zero means the `0x15`
+    // handler has not run yet in this client session.
+    if (id === 0 || width === 0 || height === 0 || width > 512 || height > 512) {
+      return {
+        state: 'unknown',
+        reason: `client map values failed validation (${id}, ${width}x${height})`
+      };
+    }
+
+    // The `0x15` handler copies the map name into a stack local and formats it
+    // for display; it never stores it on the map model, which is why the title
+    // is not beside the identity above. It reaches a separate object published
+    // through RVA 0x29b4b4 — the same singleton bank as the resource model at
+    // 0x29b4e4 — whose title field sits at +0xf8. Absent rather than guessed:
+    // anything unreadable or implausible yields no title at all.
+    let title = null;
+
+    try {
+      const owner = mainModule.base.add(0x0029b4b4).readPointer();
+
+      if (!owner.isNull()) {
+        const range = Process.findRangeByAddress(owner);
+
+        if (range !== null && range.protection.includes('r') &&
+            owner.add(0xf8 + 2).compare(range.base.add(range.size)) < 0) {
+          const text = owner.add(0xf8).readUtf16String();
+
+          if (typeof text === 'string' && text.length > 0 && text.length <= 64 &&
+              /^[\x20-\x7e]+$/.test(text)) {
+            title = text;
+          }
+        }
+      }
+    } catch (error) {
+      title = null;
+    }
+
+    return { state: 'known', id, width, height, title, source: 'client-memory-build-752' };
+  } catch (error) {
+    return { state: 'unknown', reason: `client map projection read failed: ${error}` };
+  }
+}
+
+/// Reports readable text reachable from the map model, for offset discovery.
+///
+/// The `0x15` handler copies the map name into a stack local and formats it for
+/// display; no store onto the map model appears in it. If the title lives there
+/// at all it is behind a pointer, the way MFC keeps a `CString`, so a scan for
+/// inline text alone would miss it. This looks for both and reports what it
+/// finds rather than deciding anything — the caller compares the result with
+/// the map the server actually named.
+function probeClientMapStrings(limit) {
+  const accessor = mainModule.base.add(0x00109470);
+  const accessorSignature = [0x0f, 0xb7, 0x81, 0xf2, 0x03, 0x00, 0x00, 0xc3];
+
+  try {
+    if (!matchesBytes(accessor, accessorSignature)) {
+      return { state: 'unknown', reason: 'client map accessor signature mismatch' };
+    }
+
+    const model = mainModule.base.add(0x0027a764).readPointer();
+
+    if (model.isNull()) {
+      return { state: 'unknown', reason: 'client map model is not initialized' };
+    }
+
+    const span = Number(limit) || 0x1000;
+    const found = [];
+
+    const plausible = (text) =>
+      typeof text === 'string' &&
+      text.length >= 3 &&
+      text.length <= 64 &&
+      /^[\x20-\x7e]+$/.test(text);
+
+    for (let offset = 0; offset + 4 <= span; offset += 4) {
+      const at = model.add(offset);
+
+      // Inline wide text, as a fixed-size character array would hold it.
+      try {
+        const inline = at.readUtf16String();
+        if (plausible(inline)) found.push({ offset, kind: 'inline', text: inline });
+      } catch (error) { /* unreadable is simply not a candidate */ }
+
+      // Text behind a pointer, as a CString-style member would hold it.
+      try {
+        const pointer = at.readPointer();
+        if (!pointer.isNull()) {
+          const range = Process.findRangeByAddress(pointer);
+          if (range !== null && range.protection.includes('r')) {
+            const wide = pointer.readUtf16String();
+            if (plausible(wide)) found.push({ offset, kind: 'pointer', text: wide });
+            const narrow = pointer.readAnsiString();
+            if (plausible(narrow)) found.push({ offset, kind: 'pointer-ansi', text: narrow });
+          }
+        }
+      } catch (error) { /* unreadable is simply not a candidate */ }
+    }
+
+    return { state: 'known', found, source: 'client-memory-build-752' };
+  } catch (error) {
+    return { state: 'unknown', reason: `client map string probe failed: ${error}` };
+  }
+}
+
+/// Locates wide text in the client and reports any static pointer to it.
+///
+/// A title is worth far more than a bare number as evidence: two bytes can
+/// equal a map id by chance, but a run of characters spelling the current map
+/// name effectively cannot. This reports where that text lives and whether any
+/// module-owned slot points at it, which is what a warm-attach read would need
+/// — an address that survives a restart, not one that happens to be valid now.
+function probeClientText(text) {
+  const needle = [];
+
+  for (const character of String(text)) {
+    const code = character.charCodeAt(0);
+    needle.push(code & 0xff, (code >> 8) & 0xff);
+  }
+
+  const pattern = needle.map((byte) => byte.toString(16).padStart(2, '0')).join(' ');
+  const main = Process.enumerateModules()[0];
+  const hits = [];
+
+  for (const range of Process.enumerateRanges('r--')) {
+    let matches;
+    try {
+      matches = Memory.scanSync(range.base, range.size, pattern);
+    } catch (error) {
+      continue;
+    }
+
+    for (const match of matches) {
+      const inMain =
+        match.address.compare(main.base) >= 0 &&
+        match.address.compare(main.base.add(main.size)) < 0;
+      const record = {
+        address: match.address.toString(),
+        in_main_module: inMain,
+        module_offset: inMain ? match.address.sub(main.base).toInt32() : null,
+        referenced_from: []
+      };
+
+      // A heap address is only useful if something stable points at it. Search
+      // every writable range, not just module-owned ones: a title held by a
+      // heap object is reachable if that object is, so the holder's identity
+      // matters as much as whether the module points at the text directly.
+      if (!inMain) {
+        const target = match.address;
+        const model = mainModule.base.add(0x0027a764).readPointer();
+
+        for (const candidate of Process.enumerateRanges('rw-')) {
+          let bytes;
+          try {
+            bytes = new Uint8Array(candidate.base.readByteArray(candidate.size));
+          } catch (error) {
+            continue;
+          }
+
+          // Match a window rather than the exact address: text embedded in a
+          // larger allocation is referenced through the container's base, so
+          // an exact match finds nothing even when the object is reachable.
+          const wanted = target.toUInt32();
+          const floor = wanted - 0x200;
+
+          for (let offset = 0; offset + 4 <= bytes.length; offset += 4) {
+            const value =
+              bytes[offset] | (bytes[offset + 1] << 8) |
+              (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24);
+            const pointer = value >>> 0;
+
+            if (pointer <= wanted && pointer >= floor) {
+              const holder = candidate.base.add(offset);
+              const inModule =
+                holder.compare(main.base) >= 0 &&
+                holder.compare(main.base.add(main.size)) < 0;
+
+              const delta = wanted - pointer;
+              const where = inModule
+                ? `module+0x${holder.sub(main.base).toInt32().toString(16)}`
+                : (!model.isNull() && holder.compare(model) >= 0 &&
+                   holder.sub(model).toInt32() < 0x8000)
+                  ? `mapmodel+0x${holder.sub(model).toInt32().toString(16)}`
+                  : `heap ${holder}`;
+
+              record.referenced_from.push(`${where} (text at +0x${delta.toString(16)})`);
+
+              if (record.referenced_from.length >= 32) break;
+            }
+          }
+        }
+      }
+
+      hits.push(record);
+      if (hits.length >= 24) return { state: 'known', hits };
+    }
+  }
+
+  return { state: 'known', hits };
+}
+
 function matchesBytes(address, expected) {
   const actual = new Uint8Array(address.readByteArray(expected.length));
 
@@ -218,6 +458,11 @@ let directPlaintextSendDepth = 0;
 const MAX_PENDING_PLAINTEXT_BODIES = 32;
 const PENDING_PLAINTEXT_POLL_RETRY_MS = 220;
 const MAX_PENDING_PLAINTEXT_WAKE_ATTEMPTS = 10;
+// Two independent successful bank captures waited about 1.22 seconds between
+// each matching 0x2f response and the next client selection. Sending 0x4c in
+// the same scheduling turn as the quantity prompt was observed in ginko-end21
+// and was ignored by the server despite having the correct body grammar.
+const DIALOG_RESPONSE_SETTLE_MS = 1200;
 const CLIENT_STEP_RETRY_MS = 220;
 const MAX_CLIENT_STEP_TAP_ATTEMPTS = 10;
 const CLIENT_SOCKET_OFFSET = 0x001d578;
@@ -504,17 +749,17 @@ function invokeClientAttack(direction) {
   // hook consumes the queued duplicate and that native body is the semantic
   // attack. Otherwise the completed native body gives `flushPlaintextBody`
   // the client-owned boundary on which to submit the queued 0x13.
-  invokeCombatPlaintextBody([0x13, 0x00, 0x00], 'attack', wakeDirection);
+  return invokeCombatPlaintextBody([0x13, 0x00, 0x00], 'attack', wakeDirection);
 }
 
 function invokeClientPickup() {
-  invokePlaintextBody([0x07, 0x01, 0x00], 'pickup');
+  return invokePlaintextBody([0x07, 0x01, 0x00], 'pickup');
 }
 
 function invokeClientFace(direction) {
   const value = Number(direction);
   combatWakeDirection = directionName(value);
-  invokeCombatPlaintextBody([0x11, value, 0x00], 'face', combatWakeDirection);
+  return invokeCombatPlaintextBody([0x11, value, 0x00], 'face', combatWakeDirection);
 }
 
 function invokeClientUseInventory(slot) {
@@ -564,14 +809,18 @@ function noteClientInventoryOutbound(input, length) {
 }
 
 function invokePlaintextBody(bytes, action) {
-  enqueuePlaintextBody(bytes, action, requestNetworkPoll);
+  return enqueuePlaintextBodies([bytes], action, requestNetworkPoll);
 }
 
 function invokeCombatPlaintextBody(bytes, action, direction) {
-  enqueuePlaintextBody(bytes, action, () => invokeClientKeyTap(direction));
+  return enqueuePlaintextBodies([bytes], action, () => invokeClientKeyTap(direction));
 }
 
-function enqueuePlaintextBody(bytes, action, wakeNetworkThread) {
+function enqueuePlaintextBodies(bodies, action, wakeNetworkThread, dialogEntity = null) {
+  if (!Array.isArray(bodies) || bodies.length === 0) {
+    throw new Error(`${action} requires at least one plaintext body`);
+  }
+
   if (sessionClosing) {
     throw new Error(`${action} rejected because the client session is closing`);
   }
@@ -580,7 +829,7 @@ function enqueuePlaintextBody(bytes, action, wakeNetworkThread) {
     throw new Error(`${action} requires one observed live outgoing session`);
   }
 
-  if (pendingPlaintextBodies.length >= MAX_PENDING_PLAINTEXT_BODIES) {
+  if (pendingPlaintextBodies.length + bodies.length > MAX_PENDING_PLAINTEXT_BODIES) {
     throw new Error(`${action} rejected because the client-thread action queue is full`);
   }
 
@@ -589,21 +838,84 @@ function enqueuePlaintextBody(bytes, action, wakeNetworkThread) {
   // or cipher state after the plaintext hook. Queue the logical body instead;
   // the build-752 network-poll hook drains it on the client-owned network
   // thread after that poll cycle has completed.
-  const pending = { bytes: Array.from(bytes), action, wakeAttempts: 1 };
-  pendingPlaintextBodies.push(pending);
+  return new Promise((resolve, reject) => {
+    const batch = {
+      action,
+      dialogEntity,
+      wakeNetworkThread,
+      remaining: bodies.length,
+      settled: false,
+      resolve,
+      reject,
+    };
+    const pending = bodies.map((bytes, index) => ({
+      bytes: Array.from(bytes),
+      action,
+      batch,
+      ready: index === 0,
+      readyAfter: null,
+      waitForDialogResponse: dialogEntity !== null && index >= 1,
+      wakeAttempts: 1,
+    }));
+    pendingPlaintextBodies.push(...pending);
 
-  try {
-    wakeNetworkThread();
-  } catch (error) {
-    pendingPlaintextBodies.pop();
-    throw error;
+    try {
+      wakeNetworkThread();
+    } catch (error) {
+      failPendingPlaintextBatch(pending[0], error);
+      return;
+    }
+
+    // A native direction may be suppressed during NexusTK's short
+    // collision/combat window. Retry only while this exact body remains queued.
+    // The outgoing hook either consumes a semantically equivalent native 0x13
+    // or drains one logical body, so repeated wakes cannot duplicate the intent.
+    schedulePendingPlaintextWake(pending[0], wakeNetworkThread);
+  });
+}
+
+function completePendingPlaintextBody(pending) {
+  const batch = pending.batch;
+
+  if (batch.settled) {
+    return;
   }
 
-  // A native direction may be suppressed during NexusTK's short
-  // collision/combat window. Retry only while this exact body remains queued.
-  // The outgoing hook either consumes a semantically equivalent native 0x13
-  // or drains one logical body, so repeated wakes cannot duplicate the intent.
-  schedulePendingPlaintextWake(pending, wakeNetworkThread);
+  batch.remaining -= 1;
+
+  if (batch.remaining === 0) {
+    batch.settled = true;
+    batch.resolve(true);
+  }
+}
+
+function failPendingPlaintextBatch(pending, error) {
+  const batch = pending.batch;
+  pendingPlaintextBodies = pendingPlaintextBodies.filter(
+    candidate => candidate.batch !== batch
+  );
+
+  if (!batch.settled) {
+    batch.settled = true;
+    batch.reject(new Error(`${batch.action} dispatch failed: ${error}`));
+  }
+}
+
+function failAllPendingPlaintextBatches(error) {
+  const pending = pendingPlaintextBodies;
+  pendingPlaintextBodies = [];
+  const failed = new Set();
+
+  for (const body of pending) {
+    if (!failed.has(body.batch)) {
+      failed.add(body.batch);
+
+      if (!body.batch.settled) {
+        body.batch.settled = true;
+        body.batch.reject(new Error(`${body.batch.action} dispatch failed: ${error}`));
+      }
+    }
+  }
 }
 
 function schedulePendingPlaintextWake(pending, wakeNetworkThread) {
@@ -641,6 +953,7 @@ function satisfyPendingNativeBody(opcode) {
 
   if (opcode === 0x13 && pending !== undefined && pending.action === 'attack') {
     pendingPlaintextBodies.shift();
+    completePendingPlaintextBody(pending);
   }
 }
 
@@ -674,11 +987,16 @@ function requestNetworkPoll() {
 
 function flushPlaintextBody(session, threadId) {
   if (sessionClosing || pendingPlaintextBodies.length === 0 || session.isNull()) {
-    return;
+    return null;
   }
 
-  const pending = pendingPlaintextBodies.shift();
+  const pending = pendingPlaintextBodies[0];
 
+  if (!pending.ready) {
+    return null;
+  }
+
+  pendingPlaintextBodies.shift();
   try {
     outgoingSession = session;
     const body = Memory.alloc(pending.bytes.length);
@@ -699,12 +1017,92 @@ function flushPlaintextBody(session, threadId) {
     }
 
     emitPacket('outgoing', body, pending.bytes.length, threadId);
+    completePendingPlaintextBody(pending);
+    return pending;
   } catch (error) {
+    failPendingPlaintextBatch(pending, error);
     send({
       type: 'client-action-failed',
       action: pending.action,
       error: `client-thread send failed: ${error}`
     });
+    return null;
+  }
+}
+
+function schedulePlaintextBody(pending) {
+  const delay = Math.max(0, pending.readyAfter - Date.now());
+
+  setTimeout(() => {
+    if (sessionClosing || !pendingPlaintextBodies.includes(pending)) {
+      return;
+    }
+
+    pending.ready = true;
+
+    try {
+      pending.batch.wakeNetworkThread();
+    } catch (error) {
+      send({
+        type: 'client-action-failed',
+        action: pending.action,
+        error: `dialog action poll failed: ${error}`
+      });
+    }
+
+    schedulePendingPlaintextWake(pending, pending.batch.wakeNetworkThread);
+  }, delay);
+}
+
+function observeDialogResponse(input, length) {
+  const pending = pendingPlaintextBodies[0];
+
+  if (pending === undefined ||
+      !pending.waitForDialogResponse ||
+      pending.batch.dialogEntity === null ||
+      length < 7 ||
+      input.isNull() ||
+      input.readU8() !== 0x2f) {
+    return;
+  }
+
+  const entity = (
+    (input.add(3).readU8() * 0x1000000) +
+    (input.add(4).readU8() << 16) +
+    (input.add(5).readU8() << 8) +
+    input.add(6).readU8()
+  ) >>> 0;
+
+  if (entity !== pending.batch.dialogEntity) {
+    return;
+  }
+
+  pending.waitForDialogResponse = false;
+  pending.readyAfter = Date.now() + DIALOG_RESPONSE_SETTLE_MS;
+  schedulePlaintextBody(pending);
+}
+
+function flushPlaintextBatch(session, threadId) {
+  if (sessionClosing || session === null || session.isNull()) {
+    return;
+  }
+
+  const first = pendingPlaintextBodies[0];
+
+  if (first === undefined) {
+    return;
+  }
+
+  const completed = flushPlaintextBody(session, threadId);
+
+  if (completed === null) {
+    return;
+  }
+
+  const next = pendingPlaintextBodies[0];
+
+  if (next?.batch === completed.batch && !next.waitForDialogResponse) {
+    schedulePlaintextBody(next);
   }
 }
 
@@ -719,7 +1117,7 @@ function entityBytes(entity) {
 }
 
 function invokeClientInteract(entity) {
-  invokePlaintextBody([0x43, 0x01, ...entityBytes(entity), 0x00], 'interact');
+  return invokePlaintextBody([0x43, 0x01, ...entityBytes(entity), 0x00], 'interact');
 }
 
 function validatedAsciiBytes(value, label) {
@@ -748,6 +1146,10 @@ function u16Bytes(value, label) {
 }
 
 function invokeClientDialog(entity, command, argument, quantity) {
+  return invokePlaintextBody(dialogBody(entity, command, argument, quantity), 'dialog');
+}
+
+function dialogBody(entity, command, argument, quantity) {
   const token = Number(command);
 
   if (!Number.isInteger(token) || token < 0 || token > 0xff) {
@@ -760,8 +1162,7 @@ function invokeClientDialog(entity, command, argument, quantity) {
     if (quantity !== null && quantity !== undefined) {
       throw new Error('dialog quantity requires an argument');
     }
-    invokePlaintextBody([...prefix, 0x00], 'dialog');
-    return;
+    return [...prefix, 0x00];
   }
 
   const bytes = validatedAsciiBytes(argument, 'dialog argument');
@@ -785,7 +1186,31 @@ function invokeClientDialog(entity, command, argument, quantity) {
     body.push(0x00);
   }
 
-  invokePlaintextBody(body, 'dialog');
+  return body;
+}
+
+function invokeClientDialogTransaction(entity, selections) {
+  if (!Array.isArray(selections) || selections.length === 0) {
+    throw new Error('dialog transaction requires at least one selection');
+  }
+
+  const interaction = [0x43, 0x01, ...entityBytes(entity), 0x00];
+  const bodies = [interaction];
+
+  for (const selection of selections) {
+    if (selection === null || typeof selection !== 'object') {
+      throw new Error('dialog transaction selection is not an object');
+    }
+
+    bodies.push(dialogBody(entity, selection.command, selection.argument, selection.quantity));
+  }
+
+  return enqueuePlaintextBodies(
+    bodies,
+    'dialog-transaction',
+    requestNetworkPoll,
+    Number(entity) >>> 0
+  );
 }
 
 function invokeClientSpeak(channel, text) {
@@ -796,7 +1221,7 @@ function invokeClientSpeak(channel, text) {
   }
 
   const bytes = validatedAsciiBytes(text, 'speech text');
-  invokePlaintextBody([0x0e, numericChannel, bytes.length, ...bytes, 0x00], 'speech');
+  return invokePlaintextBody([0x0e, numericChannel, bytes.length, ...bytes, 0x00], 'speech');
 }
 
 function invokeClientAnsweredSpell(slot, answer) {
@@ -807,7 +1232,7 @@ function invokeClientAnsweredSpell(slot, answer) {
   }
 
   const bytes = validatedAsciiBytes(answer, 'spell answer');
-  invokePlaintextBody([0x0f, numericSlot, ...bytes, 0x00], 'answered-spell');
+  return invokePlaintextBody([0x0f, numericSlot, ...bytes, 0x00], 'answered-spell');
 }
 
 function activeTravelSelector() {
@@ -842,8 +1267,7 @@ function invokeClientTravel(map) {
     return false;
   }
 
-  requestNetworkPoll();
-  return true;
+  return submitPendingTravelSelection();
 }
 
 function validatedTravelSelection(map, x, y) {
@@ -983,7 +1407,7 @@ function submitPendingTravelSelection() {
       selection.selector === null ||
       selection.row === null ||
       submitTravelSelectorRow === null) {
-    return;
+    return false;
   }
 
   // Consume before entering native code. This runs only after the network poll
@@ -994,12 +1418,14 @@ function submitPendingTravelSelection() {
 
   try {
     submitTravelSelectorRow(selection.selector, selection.row);
+    return true;
   } catch (error) {
     send({
       type: 'client-action-failed',
       action: selection.action,
       error: `native selector submission failed: ${error}`
     });
+    return false;
   }
 }
 
@@ -1033,8 +1459,11 @@ function installTravelSelectorHook() {
     onLeave() {
       // The constructor has populated the complete 0x94-byte row vector before
       // returning. Binding here avoids both an unrelated 0x4c-byte container
-      // helper and partially initialized selector state.
+      // helper and partially initialized selector state. Submit at this same
+      // client-owned boundary: the selector is modal, so waiting for another
+      // network poll can leave the native 0x3f enqueue permanently uncalled.
       bindPendingTravelSelection(this.selector);
+      submitPendingTravelSelection();
     }
   });
 }
@@ -1265,6 +1694,15 @@ rpc.exports = {
   clientResources() {
     return readClientResources();
   },
+  clientMapContext() {
+    return readClientMapContext();
+  },
+  clientMapStrings(limit) {
+    return probeClientMapStrings(limit);
+  },
+  clientFindText(text) {
+    return probeClientText(text);
+  },
   clientInventory() {
     return readClientInventory();
   },
@@ -1276,8 +1714,7 @@ rpc.exports = {
     return true;
   },
   clientFace(direction) {
-    invokeClientFace(direction);
-    return true;
+    return invokeClientFace(direction);
   },
   clientRefresh() {
     invokeClientRefresh();
@@ -1295,40 +1732,36 @@ rpc.exports = {
     // The body is the captured normal self-profile request. It is submitted
     // through the client's already-live crypto/session routine, not a raw
     // socket, so nonce and transport state remain owned by NexusTK.
-    invokePlaintextBody([0x2d, 0x00, 0x00], 'request-profile');
-    return true;
+    return invokePlaintextBody([0x2d, 0x00, 0x00], 'request-profile');
   },
   clientCastSpell(slot) {
     invokeClientCastSpell(slot);
     return true;
   },
   clientAttack(direction) {
-    invokeClientAttack(direction);
-    return true;
+    return invokeClientAttack(direction);
   },
   clientPickup() {
-    invokeClientPickup();
-    return true;
+    return invokeClientPickup();
   },
   clientUseInventory(slot) {
     invokeClientUseInventory(slot);
     return true;
   },
   clientInteract(entity) {
-    invokeClientInteract(entity);
-    return true;
+    return invokeClientInteract(entity);
   },
   clientDialog(entity, command, argument, quantity) {
-    invokeClientDialog(entity, command, argument, quantity);
-    return true;
+    return invokeClientDialog(entity, command, argument, quantity);
+  },
+  clientDialogTransaction(entity, selections) {
+    return invokeClientDialogTransaction(entity, selections);
   },
   clientSpeak(channel, text) {
-    invokeClientSpeak(channel, text);
-    return true;
+    return invokeClientSpeak(channel, text);
   },
   clientAnsweredSpell(slot, answer) {
-    invokeClientAnsweredSpell(slot, answer);
-    return true;
+    return invokeClientAnsweredSpell(slot, answer);
   },
   clientTravel(map) {
     return invokeClientTravel(map);
@@ -1364,7 +1797,7 @@ Interceptor.attach(networkPollAddress, {
     this.session = this.context.ecx;
   },
   onLeave() {
-    flushPlaintextBody(this.session, this.threadId);
+    flushPlaintextBatch(this.session, this.threadId);
     submitPendingTravelSelection();
   }
 });
@@ -1385,7 +1818,7 @@ Interceptor.attach(outgoingAddress, {
     // a later login request can establish another sender in the same process.
     if (opcode === 0x03) {
       sessionClosing = false;
-      pendingPlaintextBodies = [];
+      failAllPendingPlaintextBatches('a new login session replaced the queued client session');
       pendingTravelSelection = null;
     }
     if (!sessionClosing) {
@@ -1400,6 +1833,7 @@ Interceptor.attach(outgoingAddress, {
     if (opcode === 0x0b) {
       sessionClosing = true;
       outgoingSession = null;
+      failAllPendingPlaintextBatches('the client session closed before dispatch');
       pendingTravelSelection = null;
     }
   },
@@ -1410,10 +1844,11 @@ Interceptor.attach(outgoingAddress, {
 
     // A real client outbound body (including the obstruction emitted by a
     // directional key pressed into a tree) proves that this is the serialized
-    // game-network thread. Drain one queued logical body only after that body
-    // has completed, so the client's session counter and cipher remain the
-    // sole source of ordering. Re-entry from cryptAndSend sees an empty queue.
-    flushPlaintextBody(this.session, this.threadId);
+    // game-network thread. Drain the first queued logical transaction only
+    // after that body has completed, so the client's session counter and
+    // cipher remain the sole source of ordering. Re-entry from cryptAndSend
+    // sees the direct-send guard.
+    flushPlaintextBatch(this.session, this.threadId);
   }
 });
 
@@ -1441,6 +1876,7 @@ Interceptor.attach(incomingAddress, {
     // decrypted body. It may observe the menu, but must never re-enter the
     // outgoing cipher or mutate its sequence state.
     observePendingTravelMenu(this.output, this.length);
+    observeDialogResponse(this.output, this.length);
   }
 });
 

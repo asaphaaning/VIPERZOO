@@ -15,7 +15,12 @@ pub struct Dimensions {
 }
 
 impl Dimensions {
-    pub(crate) fn new(width: u16, height: u16) -> Option<Self> {
+    /// Creates dimensions, or `None` when either extent is zero.
+    ///
+    /// A map the client can render has both extents, so a zero here means the
+    /// source has no map rather than a map of no size.
+    #[must_use]
+    pub fn new(width: u16, height: u16) -> Option<Self> {
         Some(Self {
             width: NonZeroU16::new(width)?,
             height: NonZeroU16::new(height)?,
@@ -32,6 +37,50 @@ impl Dimensions {
     #[must_use]
     pub const fn height(self) -> u16 {
         self.height.get()
+    }
+}
+
+/// Which map is active, and how large it is.
+///
+/// Identifier and dimensions travel together because neither source of map
+/// identity offers one without the other: the server's [`Context`] carries
+/// both, and the client stores and re-validates both before it will reload a
+/// map. That matters for memory-derived identity, where a bare identifier is
+/// unverifiable — any two bytes can equal a map number — while the pair can be
+/// checked against a map that is actually known.
+///
+/// ```
+/// use viperzoo_protocol::map::{Dimensions, Identity};
+/// use viperzoo_protocol::primitive::MapId;
+///
+/// let grove = Identity::new(MapId::new(0x0482), Dimensions::new(60, 60).unwrap());
+///
+/// assert_eq!(grove.id().value(), 0x0482);
+/// assert_eq!(grove.dimensions().width(), 60);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct Identity {
+    id: MapId,
+    dimensions: Dimensions,
+}
+
+impl Identity {
+    /// Joins a map identifier to the dimensions observed alongside it.
+    #[must_use]
+    pub const fn new(id: MapId, dimensions: Dimensions) -> Self {
+        Self { id, dimensions }
+    }
+
+    /// Returns the map identifier.
+    #[must_use]
+    pub const fn id(self) -> MapId {
+        self.id
+    }
+
+    /// Returns the full map dimensions.
+    #[must_use]
+    pub const fn dimensions(self) -> Dimensions {
+        self.dimensions
     }
 }
 
@@ -78,6 +127,12 @@ impl Context {
     #[must_use]
     pub const fn dimensions(&self) -> Dimensions {
         self.dimensions
+    }
+
+    /// Returns the identity this context establishes.
+    #[must_use]
+    pub const fn identity(&self) -> Identity {
+        Identity::new(self.id, self.dimensions)
     }
 
     /// Returns the display title.

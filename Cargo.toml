@@ -9,6 +9,7 @@ members = [
   "crates/navigation",
   "crates/sdk",
   "crates/protocol",
+  "crates/web",
   "crates/world",
   "apps/cli",
   "apps/live",
@@ -29,11 +30,13 @@ version      = "0.1.0"
 frida = { git = "https://github.com/frida/frida-rust", rev = "080e8a99a542150359c835cd8b572f699f7a2313", features = [
   "auto-download",
 ] }
+axum = { version = "0.8", default-features = false, features = [ "http1", "tokio" ] }
 hex = "0.4.3"
 serde = { version = "1.0.228", features = [ "derive" ] }
 serde_json = "1.0.149"
 thiserror = "2.0.17"
 tokio = "1.49"
+tokio-stream = { version = "0.1", features = [ "sync" ] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 

@@ -1,9 +1,10 @@
 //! Read static object knowledge from versioned `NexusTK` client assets.
 //!
 //! [`load`] opens the KRU `Data/tile.dat` archive and decodes its `SObj.tbl`
-//! member. Each one-based object record contains visual tile IDs, five bytes of
-//! still-uninterpreted metadata, and a directional collision nibble. The result
-//! is a [`Catalog`] keyed by the same object ID carried by a live map tile.
+//! member. Each one-based object record contains structurally decoded but
+//! semantically unresolved [`Metadata`], a [`Collision`] mask, and visual tile
+//! IDs. The result is a [`Catalog`] keyed by the same object ID carried by a
+//! live map tile.
 //!
 //! The catalog does **not** replace or mutate live map knowledge. A streamed
 //! region remains authoritative for the coordinate, ground ID, server pass
@@ -30,4 +31,4 @@ mod archive;
 mod object;
 
 pub use archive::{Error, read_entry};
-pub use object::{Catalog, Fixture, LoadError, decode, load, load_default};
+pub use object::{Catalog, Collision, Fixture, LoadError, Metadata, decode, load, load_default};

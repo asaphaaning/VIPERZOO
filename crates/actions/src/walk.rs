@@ -2,13 +2,16 @@
 //!
 //! A route is only a statement about one snapshot. This controller requests one
 //! client-native step, waits for movement or obstruction evidence, learns a
-//! repeated silent refusal as a directed edge, then plans again. It therefore
+//! refused edge as a directed collision, then plans again. It therefore
 //! adapts to streamed tiles and moving entities instead of executing a stale
 //! route as a blind command queue.
 //!
-//! The target is bound to the map epoch established during bootstrap. If a map
-//! change occurs, the transaction stops rather than applying the same numeric
-//! coordinate to a different map.
+//! The target is bound to the map epoch established during bootstrap. If that
+//! epoch advances, the transaction stops rather than applying the same numeric
+//! coordinate to a different map. How it stops depends on why the epoch moved:
+//! a warm attachment learning its own identity yields [`Error::MapIdentified`],
+//! which the caller can recover from by re-deciding the destination, while a
+//! genuine crossing yields [`Error::MapChanged`].
 
 use std::{fmt, time::Duration};
 
@@ -18,9 +21,12 @@ use tracing::{debug, instrument};
 use viperzoo_adapter_api::action::{self, Client};
 use viperzoo_assets::Catalog;
 use viperzoo_engine::Handle;
-use viperzoo_navigation::{Edge, Knowledge, Plan, plan, plan_with_assets};
+use viperzoo_navigation::{Avoidance, Knowledge, Plan, plan_avoiding, plan_with_assets_avoiding};
+
+/// The directed step reported by [`Error::MapChanged`].
+pub use viperzoo_navigation::Edge;
 use viperzoo_protocol::{direction::Direction, primitive::Position};
-use viperzoo_world::snapshot::Snapshot;
+use viperzoo_world::{map::Origin, snapshot::Snapshot};
 
 const EDGE_OBSERVATIONS: u8 = 3;
 const REVALIDATION_EPOCHS: u8 = 3;
@@ -85,7 +91,7 @@ impl Report {
         self.attempts
     }
 
-    /// Returns how many silent refusal edges were learned during the run.
+    /// Returns how many client-refused or silent-refusal edges were learned during the run.
     #[must_use]
     pub const fn learned_edges(self) -> u32 {
         self.learned_edges
@@ -111,7 +117,7 @@ impl Report {
     name = "viperzoo::actions::walk_to",
     skip(client, engine),
     fields(target_x = target.x().value(), target_y = target.y().value()),
-    err,
+    err(level = "debug"),
     ret(level = "debug")
 )]
 pub async fn to<C>(
@@ -124,7 +130,33 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    run(client, engine, target, config, None).await
+    to_avoiding(client, engine, &Avoidance::new(), target, config).await
+}
+
+/// Walks to `target` while excluding caller-declared semantic boundaries.
+///
+/// # Errors
+///
+/// Returns the same [`enum@Error`] vocabulary as [`to`].
+#[instrument(
+    name = "viperzoo::actions::walk_to_avoiding",
+    skip(client, engine, avoidance),
+    fields(target_x = target.x().value(), target_y = target.y().value()),
+    err(level = "debug"),
+    ret(level = "debug")
+)]
+pub async fn to_avoiding<C>(
+    client: &C,
+    engine: &Handle,
+    avoidance: &Avoidance,
+    target: Position,
+    config: Config,
+) -> Result<Report, Error<C::Error>>
+where
+    C: Client,
+    C::Error: fmt::Debug + fmt::Display,
+{
+    run(client, engine, avoidance, target, config, None).await
 }
 
 /// Walks to `target` with client-asset directional fixture collision.
@@ -136,7 +168,7 @@ where
     name = "viperzoo::actions::walk_to_with_assets",
     skip(client, engine, assets),
     fields(target_x = target.x().value(), target_y = target.y().value()),
-    err,
+    err(level = "debug"),
     ret(level = "debug")
 )]
 pub async fn to_with_assets<C>(
@@ -150,19 +182,47 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    run(client, engine, target, config, Some(assets)).await
+    to_with_assets_avoiding(client, engine, assets, &Avoidance::new(), target, config).await
+}
+
+/// Walks to `target` with fixture collision and route-local avoidance.
+///
+/// # Errors
+///
+/// Returns the same [`enum@Error`] vocabulary as [`to_with_assets`].
+#[instrument(
+    name = "viperzoo::actions::walk_to_with_assets_avoiding",
+    skip(client, engine, assets, avoidance),
+    fields(target_x = target.x().value(), target_y = target.y().value()),
+    err(level = "debug"),
+    ret(level = "debug")
+)]
+pub async fn to_with_assets_avoiding<C>(
+    client: &C,
+    engine: &Handle,
+    assets: &Catalog,
+    avoidance: &Avoidance,
+    target: Position,
+    config: Config,
+) -> Result<Report, Error<C::Error>>
+where
+    C: Client,
+    C::Error: fmt::Debug + fmt::Display,
+{
+    run(client, engine, avoidance, target, config, Some(assets)).await
 }
 
 #[instrument(
     name = "viperzoo::actions::walk::run",
-    skip(client, engine, assets),
+    skip(client, engine, assets, avoidance),
     fields(target_x = target.x().value(), target_y = target.y().value(), assets = assets.is_some()),
-    err,
+    err(level = "debug"),
     ret(level = "debug")
 )]
 async fn run<C>(
     client: &C,
     engine: &Handle,
+    avoidance: &Avoidance,
     target: Position,
     config: Config,
     assets: Option<&Catalog>,
@@ -177,20 +237,30 @@ where
     let mut knowledge = Knowledge::new();
     let mut learned_edges = 0_u32;
     let mut revalidation_epochs = 0_u8;
+    // The step still in flight when the map changes is the edge that crossed.
+    let mut crossing: Option<Edge> = None;
 
     'walk: loop {
         let snapshot = snapshots.borrow().clone();
 
-        if snapshot.map().epoch() != epoch {
-            return Err(Error::MapChanged {
-                from: epoch.value(),
-                to: snapshot.map().epoch().value(),
+        let observed = snapshot.map().epoch();
+
+        if observed != epoch {
+            return Err(match observed.origin() {
+                Origin::Established => Error::MapIdentified {
+                    epoch: observed.value(),
+                },
+                Origin::Attachment | Origin::Crossed => Error::MapChanged {
+                    from: epoch.value(),
+                    to: observed.value(),
+                    crossing,
+                },
             });
         }
 
         let planned = assets.map_or_else(
-            || plan(&snapshot, &knowledge, target),
-            |assets| plan_with_assets(&snapshot, &knowledge, assets, target),
+            || plan_avoiding(&snapshot, &knowledge, avoidance, target),
+            |assets| plan_with_assets_avoiding(&snapshot, &knowledge, assets, avoidance, target),
         );
         let route = match planned {
             Err(viperzoo_navigation::Error::NoRoute { .. })
@@ -240,13 +310,36 @@ where
                 "submitting client-native step"
             );
 
+            crossing = Some(edge);
             client
                 .perform(action::Action::Step(direction))
                 .await
                 .map_err(Error::Client)?;
 
-            match wait_for_step(&mut snapshots, origin, destination, config.step_timeout).await {
-                Ok(()) => {
+            match wait_for_step(
+                &mut snapshots,
+                origin,
+                destination,
+                direction,
+                config.step_timeout,
+            )
+            .await
+            {
+                Ok(StepOutcome::Moved) => {
+                    time::sleep(config.settle_delay).await;
+                    continue 'walk;
+                }
+                Ok(StepOutcome::Obstructed) => {
+                    if knowledge.block(edge) {
+                        learned_edges += 1;
+                    }
+
+                    debug!(
+                        x = origin.x().value(),
+                        y = origin.y().value(),
+                        ?direction,
+                        "client reported a directed obstruction; replanning around the edge"
+                    );
                     time::sleep(config.settle_delay).await;
                     continue 'walk;
                 }
@@ -369,23 +462,51 @@ async fn wait_for_step(
     snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
     origin: Position,
     destination: Position,
+    direction: Direction,
     timeout: Duration,
-) -> Result<(), WaitError> {
-    wait_until(snapshots, timeout, |snapshot| {
-        let position = snapshot.player().location().position();
+) -> Result<StepOutcome, WaitError> {
+    if let Some(outcome) = step_outcome(&snapshots.borrow(), origin, destination, direction) {
+        return Ok(outcome);
+    }
 
-        position == Some(destination)
-            || position.is_some_and(|position| position != origin)
-            || matches!(
-                snapshot.player().location(),
-                viperzoo_world::player::Location::ClientReported {
-                    position,
-                    evidence: viperzoo_world::player::ClientEvidence::Obstruction { .. },
-                    ..
-                } if *position == origin
-            )
+    time::timeout(timeout, async {
+        loop {
+            snapshots.changed().await.map_err(|_| WaitError::Stopped)?;
+
+            if let Some(outcome) = step_outcome(&snapshots.borrow(), origin, destination, direction)
+            {
+                return Ok(outcome);
+            }
+        }
     })
     .await
+    .map_err(|_| WaitError::Timeout)?
+}
+
+fn step_outcome(
+    snapshot: &Snapshot,
+    origin: Position,
+    destination: Position,
+    direction: Direction,
+) -> Option<StepOutcome> {
+    let location = snapshot.player().location();
+    let position = location.position();
+
+    if position == Some(destination) || position.is_some_and(|position| position != origin) {
+        return Some(StepOutcome::Moved);
+    }
+
+    matches!(
+        location,
+        viperzoo_world::player::Location::ClientReported {
+            position,
+            evidence: viperzoo_world::player::ClientEvidence::Obstruction {
+                direction: observed,
+            },
+            ..
+        } if *position == origin && *observed == direction
+    )
+    .then_some(StepOutcome::Obstructed)
 }
 
 async fn wait_until(
@@ -416,6 +537,15 @@ enum WaitError {
     Timeout,
 }
 
+/// The first client-local state transition that resolves a submitted step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepOutcome {
+    /// The client reported a different player tile.
+    Moved,
+    /// The client reported that the submitted directed edge was blocked.
+    Obstructed,
+}
+
 /// Destination-controller failure.
 #[derive(Debug, Error)]
 pub enum Error<E>
@@ -431,13 +561,35 @@ where
     /// The canonical engine stopped during the run.
     #[error("canonical engine stopped during destination walking")]
     EngineStopped,
+    /// Map identity became known after the target was planned without it.
+    ///
+    /// A warm attachment plans against provisional coverage. The first
+    /// observed context ([`Origin::Established`]) proves which map that
+    /// coverage belonged to, so the numeric destination must be re-decided
+    /// rather than walked. The player has not necessarily moved, which makes
+    /// this recoverable for a caller that can choose a destination again.
+    #[error("map identity was established at epoch {epoch}; the destination must be re-decided")]
+    MapIdentified {
+        /// Epoch in which map identity first became known.
+        epoch: u64,
+    },
     /// The map identity epoch changed before the map-scoped target was reached.
+    ///
+    /// Identity replaced a different identified map ([`Origin::Crossed`]), so
+    /// the target names a place on a map the player has left.
     #[error("map epoch changed from {from} to {to}; destination is no longer valid")]
     MapChanged {
         /// Epoch against which the target was planned.
         from: u64,
         /// Newly observed epoch that invalidated the target.
         to: u64,
+        /// The step in flight when the change was observed.
+        ///
+        /// [`Edge::destination`] is the tile that transferred maps. A caller
+        /// that did not intend a crossing can record it, so a route learns the
+        /// portal it discovered instead of rediscovering it every attempt.
+        /// Absent only when the change arrived before any step was submitted.
+        crossing: Option<Edge>,
     },
     /// Current projected state admits no route.
     #[error(transparent)]
@@ -455,7 +607,7 @@ mod tests {
     use std::{
         convert::Infallible,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -474,6 +626,12 @@ mod tests {
     struct CountingClient {
         map_data_requests: Arc<AtomicUsize>,
         refresh_requests: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct ObstructingClient {
+        engine: Handle,
+        directions: Arc<Mutex<Vec<Direction>>>,
     }
 
     impl Client for CountingClient {
@@ -518,6 +676,45 @@ mod tests {
         }
     }
 
+    impl Client for ObstructingClient {
+        type Error = Infallible;
+
+        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
+            let action::Action::Step(direction) = action else {
+                return Ok(());
+            };
+            self.directions
+                .lock()
+                .expect("test direction log remains available")
+                .push(direction);
+
+            let position = self
+                .engine
+                .snapshot()
+                .player()
+                .location()
+                .position()
+                .expect("test fixture is localized");
+            let body = format!(
+                "69{:04x}{:04x}{:02x}00",
+                position.x().value(),
+                position.y().value(),
+                direction.to_wire(),
+            );
+            let packet = decode(
+                Flow::Serverbound,
+                &hex::decode(body).expect("constructed obstruction body is valid hex"),
+            )
+            .expect("constructed obstruction body is structurally valid");
+            self.engine
+                .observe(packet.into())
+                .await
+                .expect("test engine remains available");
+
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn map_transition_invalidates_numeric_destination() {
         let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
@@ -540,7 +737,10 @@ mod tests {
         };
         let result = to(&client, &engine, Position::new(3, 0), Config::default()).await;
 
-        assert!(matches!(result, Err(Error::MapChanged { from: 1, to: 2 })));
+        assert!(matches!(
+            result,
+            Err(Error::MapChanged { from: 1, to: 2, .. })
+        ));
 
         engine.shutdown().await.expect("engine shuts down");
         owner.await.expect("engine owner joins");
@@ -572,6 +772,48 @@ mod tests {
         assert_eq!(attempts, 0);
         assert_eq!(client.map_data_requests.load(Ordering::Relaxed), 0);
         assert_eq!(client.refresh_requests.load(Ordering::Relaxed), 0);
+
+        engine.shutdown().await.expect("engine shuts down");
+        owner.await.expect("engine owner joins");
+    }
+
+    #[tokio::test]
+    async fn reported_obstruction_replans_instead_of_repeating_the_same_edge() {
+        let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
+        let owner = tokio::spawn(task.run());
+
+        let packet = decode(
+            Flow::Clientbound,
+            &hex::decode("04000300010003000100410000").expect("fixture hex is valid"),
+        )
+        .expect("fixture packet decodes");
+        engine
+            .observe(packet.into())
+            .await
+            .expect("test engine remains available");
+
+        let directions = Arc::new(Mutex::new(Vec::new()));
+        let client = ObstructingClient {
+            engine: engine.clone(),
+            directions: directions.clone(),
+        };
+        let config = Config::new(
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+            Duration::ZERO,
+            2,
+        );
+        let result = to(&client, &engine, Position::new(4, 1), config).await;
+
+        assert!(matches!(result, Err(Error::Attempts(2))));
+        {
+            let directions = directions
+                .lock()
+                .expect("test direction log remains available");
+            assert_eq!(directions.len(), 2);
+            assert_eq!(directions[0], Direction::Right);
+            assert_ne!(directions[1], Direction::Right);
+        }
 
         engine.shutdown().await.expect("engine shuts down");
         owner.await.expect("engine owner joins");

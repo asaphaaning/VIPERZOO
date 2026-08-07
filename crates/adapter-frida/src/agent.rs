@@ -301,7 +301,7 @@ mod tests {
         assert!(SOURCE.contains("clientActivity()"));
         assert!(SOURCE.contains("networkPollAddress"));
         assert!(SOURCE.contains("directPlaintextSendDepth"));
-        assert!(SOURCE.contains("flushPlaintextBody(this.session, this.threadId)"));
+        assert!(SOURCE.contains("flushPlaintextBatch(this.session, this.threadId)"));
         assert!(SOURCE.contains("emitPacket('outgoing', body, pending.bytes.length, threadId)"));
         assert!(SOURCE.contains("client-thread action queue"));
         assert!(SOURCE.contains("requestNetworkPoll()"));
@@ -310,6 +310,14 @@ mod tests {
         assert!(SOURCE.contains("clientAnsweredSpell(slot, answer)"));
         assert!(SOURCE.contains("clientTravel(map)"));
         assert!(SOURCE.contains("clientTravelOnMenu(map)"));
+        assert!(SOURCE.contains("clientDialogTransaction(entity, selections)"));
+        assert!(SOURCE.contains("'dialog-transaction'"));
+        assert!(SOURCE.contains("Number(entity) >>> 0"));
+        assert!(SOURCE.contains("const DIALOG_RESPONSE_SETTLE_MS = 1200"));
+        assert!(SOURCE.contains("waitForDialogResponse: dialogEntity !== null && index >= 1"));
+        assert!(SOURCE.contains("observeDialogResponse(this.output, this.length)"));
+        assert!(SOURCE.contains("input.readU8() !== 0x2f"));
+        assert!(SOURCE.contains("pending.readyAfter = Date.now() + DIALOG_RESPONSE_SETTLE_MS"));
         assert!(SOURCE.contains("const body = [...prefix, bytes.length, ...bytes];"));
         assert!(SOURCE.contains("body.push(quantityBytes.length, ...quantityBytes, 0x00)"));
     }
@@ -331,7 +339,7 @@ mod tests {
 
         assert!(incoming.contains("this.session = session;"));
         assert!(incoming.contains("observePendingTravelMenu(this.output, this.length);"));
-        assert!(!incoming.contains("flushPlaintextBody(this.session, this.threadId);"));
+        assert!(!incoming.contains("flushPlaintextBatch(this.session, this.threadId);"));
     }
 
     #[test]
@@ -345,6 +353,15 @@ mod tests {
         assert!(SOURCE.contains("selection.x === null"));
         assert!(SOURCE.contains("constructor has populated the complete 0x94-byte row vector"));
         assert!(SOURCE.contains("bindPendingTravelSelection(this.selector)"));
+        assert!(SOURCE.contains("the selector is modal"));
+        // Binding and submitting must stay adjacent: the selector is modal, so
+        // deferring the submit to another network poll can strand the native
+        // enqueue. Checkouts differ in line endings, so compare normalised.
+        let adjacent = SOURCE.replace("\r\n", "\n");
+
+        assert!(adjacent.contains(
+            "bindPendingTravelSelection(this.selector);\n      submitPendingTravelSelection();"
+        ));
         assert!(SOURCE.contains("submitTravelSelectorRow(selection.selector, selection.row)"));
         assert!(!SOURCE.contains("pendingPlaintextBodies.push(pendingTravelSelection)"));
         assert!(SOURCE.contains("pendingTravelSelection = null"));
@@ -357,6 +374,35 @@ mod tests {
         assert!(!SOURCE.contains(
             "pending action did not reach the client network thread after ${pending.wakeAttempts} wakes"
         ));
+    }
+
+    #[test]
+    fn queued_plaintext_rpc_resolves_only_after_client_thread_dispatch() {
+        assert!(SOURCE.contains("return new Promise((resolve, reject) =>"));
+        assert!(SOURCE.contains("completePendingPlaintextBody(pending)"));
+        assert!(SOURCE.contains("batch.resolve(true)"));
+        assert!(SOURCE.contains("return invokeClientSpeak(channel, text)"));
+
+        let flush = SOURCE
+            .split_once("function flushPlaintextBody(session, threadId)")
+            .and_then(|(_, tail)| tail.split_once("function schedulePlaintextBody(pending)"))
+            .map(|(body, _)| body)
+            .expect("built-in agent retains the plaintext flush function");
+        let emitted = flush
+            .find("emitPacket('outgoing', body, pending.bytes.length, threadId)")
+            .expect("the dispatched body remains observable");
+        let completed = flush
+            .find("completePendingPlaintextBody(pending)")
+            .expect("dispatch completes the RPC receipt");
+
+        assert!(emitted < completed);
+    }
+
+    #[test]
+    fn dialog_transaction_is_gated_by_each_server_response() {
+        assert!(SOURCE.contains("waitForDialogResponse: dialogEntity !== null && index >= 1"));
+        assert!(SOURCE.contains("pending.waitForDialogResponse = false"));
+        assert!(SOURCE.contains("pending.readyAfter = Date.now() + DIALOG_RESPONSE_SETTLE_MS"));
     }
 
     #[test]
