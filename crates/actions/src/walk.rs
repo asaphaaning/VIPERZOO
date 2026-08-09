@@ -16,17 +16,17 @@
 use std::{fmt, time::Duration};
 
 use thiserror::Error;
-use tokio::{sync::watch, time};
+use tokio::time;
 use tracing::{debug, instrument};
 use viperzoo_adapter_api::action::{self, Client};
 use viperzoo_assets::Catalog;
-use viperzoo_engine::World;
+use viperzoo_engine::{Subscription, WaitError as WorldWaitError, World};
 use viperzoo_navigation::{Avoidance, Knowledge, Plan, plan_avoiding, plan_with_assets_avoiding};
 
 /// The directed step reported by [`Error::MapChanged`].
 pub use viperzoo_navigation::Edge;
 use viperzoo_protocol::{direction::Direction, primitive::Position};
-use viperzoo_world::{map::Origin, snapshot::Snapshot};
+use viperzoo_world::{map::Origin, query, snapshot::Snapshot};
 
 const EDGE_OBSERVATIONS: u8 = 3;
 const REVALIDATION_EPOCHS: u8 = 3;
@@ -233,7 +233,7 @@ where
 {
     let mut snapshots = world.subscribe();
     let mut attempts = bootstrap(client, &mut snapshots, config).await?;
-    let epoch = snapshots.borrow().map().epoch();
+    let epoch = snapshots.latest().map().epoch();
     let mut knowledge = Knowledge::new();
     let mut learned_edges = 0_u32;
     let mut revalidation_epochs = 0_u8;
@@ -241,7 +241,7 @@ where
     let mut crossing: Option<Edge> = None;
 
     'walk: loop {
-        let snapshot = snapshots.borrow().clone();
+        let snapshot = snapshots.latest();
 
         let observed = snapshot.map().epoch();
 
@@ -345,7 +345,7 @@ where
                 }
                 Err(WaitError::Stopped) => return Err(Error::WorldStopped),
                 Err(WaitError::Timeout)
-                    if snapshots.borrow().entities_at(destination).next().is_some() =>
+                    if snapshots.latest().entities_at(destination).next().is_some() =>
                 {
                     debug!(
                         x = destination.x().value(),
@@ -376,7 +376,7 @@ where
 )]
 async fn bootstrap<C>(
     client: &C,
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    snapshots: &mut Subscription,
     config: Config,
 ) -> Result<u32, Error<C::Error>>
 where
@@ -387,7 +387,7 @@ where
     // the player's projected position.  Do not add a force-response/refresh
     // round trip in that latency-sensitive window: it is both unnecessary and
     // creates avoidable client activity during the transition.
-    if localized(&snapshots.borrow()) {
+    if localized(&snapshots.latest()) {
         return Ok(0);
     }
 
@@ -396,7 +396,7 @@ where
         .await
         .map_err(Error::Client)?;
 
-    if !localized(&snapshots.borrow()) {
+    if !localized(&snapshots.latest()) {
         client
             .perform(action::Action::RefreshMap)
             .await
@@ -408,7 +408,7 @@ where
         }
     }
 
-    if localized(&snapshots.borrow()) {
+    if localized(&snapshots.latest()) {
         Ok(0)
     } else {
         localize(client, snapshots, config.step_timeout).await
@@ -427,7 +427,7 @@ fn localized(snapshot: &Snapshot) -> bool {
 )]
 async fn localize<C>(
     client: &C,
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    snapshots: &mut Subscription,
     timeout: Duration,
 ) -> Result<u32, Error<C::Error>>
 where
@@ -459,28 +459,19 @@ where
 }
 
 async fn wait_for_step(
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    snapshots: &mut Subscription,
     origin: Position,
     destination: Position,
     direction: Direction,
     timeout: Duration,
 ) -> Result<StepOutcome, WaitError> {
-    if let Some(outcome) = step_outcome(&snapshots.borrow(), origin, destination, direction) {
-        return Ok(outcome);
-    }
-
-    time::timeout(timeout, async {
-        loop {
-            snapshots.changed().await.map_err(|_| WaitError::Stopped)?;
-
-            if let Some(outcome) = step_outcome(&snapshots.borrow(), origin, destination, direction)
-            {
-                return Ok(outcome);
-            }
-        }
-    })
-    .await
-    .map_err(|_| WaitError::Timeout)?
+    snapshots
+        .wait(query::select(move |snapshot| {
+            step_outcome(snapshot, origin, destination, direction)
+        }))
+        .within(timeout)
+        .await
+        .map_err(wait_error)
 }
 
 fn step_outcome(
@@ -510,25 +501,22 @@ fn step_outcome(
 }
 
 async fn wait_until(
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    snapshots: &mut Subscription,
     timeout: Duration,
     predicate: impl Fn(&Snapshot) -> bool,
 ) -> Result<(), WaitError> {
-    if predicate(&snapshots.borrow()) {
-        return Ok(());
+    snapshots
+        .wait(query::when(predicate))
+        .within(timeout)
+        .await
+        .map_err(wait_error)
+}
+
+const fn wait_error(error: WorldWaitError) -> WaitError {
+    match error {
+        WorldWaitError::Closed => WaitError::Stopped,
+        WorldWaitError::Elapsed { .. } => WaitError::Timeout,
     }
-
-    time::timeout(timeout, async {
-        loop {
-            snapshots.changed().await.map_err(|_| WaitError::Stopped)?;
-
-            if predicate(&snapshots.borrow()) {
-                return Ok(());
-            }
-        }
-    })
-    .await
-    .map_err(|_| WaitError::Timeout)?
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -691,7 +679,7 @@ mod tests {
 
             let position = self
                 .world
-                .snapshot()
+                .latest()
                 .player()
                 .location()
                 .position()

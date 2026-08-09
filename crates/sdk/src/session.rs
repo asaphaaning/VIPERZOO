@@ -284,10 +284,7 @@ mod tests {
             .await
             .expect("fake session starts");
 
-        assert_eq!(
-            session.world.snapshot().revision(),
-            Revision::INITIAL.next()
-        );
+        assert_eq!(session.world.latest().revision(), Revision::INITIAL.next());
         session.owner.shutdown().await.expect("session stops");
     }
 }

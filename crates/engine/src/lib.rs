@@ -21,4 +21,7 @@ mod reducer;
 mod runtime;
 
 pub use reducer::Reducer;
-pub use runtime::{Channel, Config, Error, Ingress, Owner, Receipt, World, channel};
+pub use runtime::{
+    Channel, Config, Error, Ingress, Owner, Receipt, Subscription, SubscriptionError, Wait,
+    WaitError, World, channel,
+};

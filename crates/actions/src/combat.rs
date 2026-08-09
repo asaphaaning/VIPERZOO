@@ -9,12 +9,11 @@
 use std::{fmt, time::Duration};
 
 use thiserror::Error;
-use tokio::{sync::watch, time};
 use tracing::instrument;
 use viperzoo_adapter_api::action::{self, Client};
-use viperzoo_engine::World;
+use viperzoo_engine::{WaitError, World};
 use viperzoo_protocol::direction::Direction;
-use viperzoo_world::{action as observed, revision::Revision, snapshot::Snapshot};
+use viperzoo_world::{action as observed, query, revision::Revision, snapshot::Snapshot};
 
 /// Timing policy for one face-and-attack transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,7 +100,7 @@ impl fmt::Display for Stage {
 ///
 /// # Errors
 ///
-/// Returns [`enum@Error`] when the adapter fails, the world stream stops, or the
+/// Returns [`enum@Error`] when the adapter fails, the world closes, or the
 /// mandatory plaintext attack body is absent before the configured timeout.
 #[instrument(
     name = "viperzoo::actions::combat::face_and_attack",
@@ -120,9 +119,8 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    let mut snapshots = world.subscribe();
-    let before = snapshots.borrow().revision();
-    let facing = if snapshots.borrow().player().facing().value() == Some(&direction) {
+    let before = world.latest().revision();
+    let facing = if world.latest().player().facing().value() == Some(&direction) {
         Facing::Retained
     } else {
         client
@@ -130,7 +128,7 @@ where
             .await
             .map_err(Error::Client)?;
         match wait_for_action(
-            &mut snapshots,
+            world,
             before,
             Stage::Facing,
             config.observation_timeout,
@@ -141,7 +139,7 @@ where
         .await
         {
             Ok(revision) => {
-                if let Some(attack) = find_action(&snapshots.borrow(), before, &|action| {
+                if let Some(attack) = find_action(&world.latest(), before, &|action| {
                     matches!(action, observed::Action::Attack)
                 }) {
                     return Ok(Report {
@@ -152,7 +150,7 @@ where
                 Facing::Observed(revision)
             }
             Err(Error::Unobserved(Stage::Facing)) => {
-                if let Some(attack) = find_action(&snapshots.borrow(), before, &|action| {
+                if let Some(attack) = find_action(&world.latest(), before, &|action| {
                     matches!(action, observed::Action::Attack)
                 }) {
                     return Ok(Report {
@@ -169,13 +167,13 @@ where
     // client's native attack body while it fails to produce `0x11`. Fence the
     // explicit attack after the facing transaction so that incidental action
     // cannot confirm the following intent.
-    let before_attack = snapshots.borrow().revision();
+    let before_attack = world.latest().revision();
     client
         .perform(action::Action::Attack(direction))
         .await
         .map_err(Error::Client)?;
     let attack = wait_for_action(
-        &mut snapshots,
+        world,
         before_attack,
         Stage::Attack,
         config.observation_timeout,
@@ -187,7 +185,7 @@ where
 }
 
 async fn wait_for_action<E>(
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    world: &World,
     after: Revision,
     stage: Stage,
     timeout: Duration,
@@ -196,21 +194,16 @@ async fn wait_for_action<E>(
 where
     E: fmt::Debug + fmt::Display,
 {
-    if let Some(revision) = find_action(&snapshots.borrow(), after, &matches) {
-        return Ok(revision);
-    }
-
-    time::timeout(timeout, async {
-        loop {
-            snapshots.changed().await.map_err(|_| Error::WorldStopped)?;
-
-            if let Some(revision) = find_action(&snapshots.borrow(), after, &matches) {
-                return Ok(revision);
-            }
-        }
-    })
-    .await
-    .map_err(|_| Error::Unobserved(stage))?
+    world
+        .wait(query::select(move |snapshot| {
+            find_action(snapshot, after, &matches)
+        }))
+        .within(timeout)
+        .await
+        .map_err(|error| match error {
+            WaitError::Closed => Error::WorldStopped,
+            WaitError::Elapsed { .. } => Error::Unobserved(stage),
+        })
 }
 
 fn find_action(
@@ -235,8 +228,8 @@ where
     /// The client action adapter rejected submission.
     #[error("client action failed: {0}")]
     Client(E),
-    /// The canonical world stream stopped before observing an action.
-    #[error("canonical world stream stopped during combat action confirmation")]
+    /// The canonical world closed before observing an action.
+    #[error("canonical world closed during combat action confirmation")]
     WorldStopped,
     /// The adapter returned without the expected outbound plaintext body.
     #[error("submitted {0} action was not observed at the plaintext protocol boundary")]
@@ -348,7 +341,7 @@ mod tests {
         };
         assert!(facing < report.attack());
         assert_eq!(
-            world.snapshot().player().facing().value(),
+            world.latest().player().facing().value(),
             Some(&Direction::Right)
         );
 
@@ -370,7 +363,7 @@ mod tests {
         face_and_attack(&client, &world, Direction::Right, Config::default())
             .await
             .expect("initial transaction establishes facing");
-        let before = world.snapshot().revision();
+        let before = world.latest().revision();
         let report = face_and_attack(&client, &world, Direction::Right, Config::default())
             .await
             .expect("retained facing permits attack");

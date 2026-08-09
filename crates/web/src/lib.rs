@@ -233,15 +233,18 @@ async fn publish(
     let mut snapshots = world.subscribe();
 
     loop {
-        if snapshots.changed().await.is_err() {
-            debug!("engine stopped; console projection ended");
-            return;
-        }
+        let snapshot = match snapshots.changed().await {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                debug!("engine stopped; console projection ended");
+                return;
+            }
+        };
 
         // The state travels with the world frame so the console never has to
         // infer it from its own last request.
         let world = World::project(
-            &snapshots.borrow().clone(),
+            &snapshot,
             assets.as_ref(),
             controls.as_ref().map(control::Controls::state),
         );
@@ -261,7 +264,7 @@ async fn events(
     State(shared): State<Shared>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let initial = World::project(
-        &shared.world.snapshot(),
+        &shared.world.latest(),
         shared.assets.as_ref(),
         shared.controls.as_ref().map(control::Controls::state),
     );

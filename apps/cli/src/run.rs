@@ -46,8 +46,8 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 break Stop::Interrupted;
             }
             result = snapshots.changed() => {
-                result.map_err(|_| Error::WorldStopped)?;
-                print_summary(&snapshots.borrow());
+                let snapshot = result.map_err(|_| Error::WorldStopped)?;
+                print_summary(&snapshot);
             }
             _ = ticker.tick() => {}
         }
@@ -149,8 +149,8 @@ pub enum Error {
     /// Session startup or teardown failed.
     #[error(transparent)]
     Session(#[from] viperzoo_sdk::Error<frida::Error>),
-    /// The canonical snapshot publisher stopped unexpectedly.
-    #[error("canonical world stream stopped")]
+    /// The canonical world subscription closed unexpectedly.
+    #[error("canonical world subscription closed")]
     WorldStopped,
     /// The terminal signal handler could not be installed.
     #[error("unable to listen for Ctrl+C: {0}")]

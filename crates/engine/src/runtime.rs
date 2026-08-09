@@ -9,13 +9,17 @@
 //! Backpressure is intentional: an acquisition boundary must slow down rather
 //! than let an unbounded queue hide lost responsiveness or memory growth.
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, instrument};
 use viperzoo_adapter_api::observation::{self, Observation};
-use viperzoo_world::{snapshot::Snapshot, world::Change};
+use viperzoo_world::{
+    query::{Query, State},
+    snapshot::Snapshot,
+    world::Change,
+};
 
 use crate::Reducer;
 
@@ -76,7 +80,7 @@ impl Receipt {
 /// drop(ingress);
 /// owner.await.expect("engine owner does not panic");
 ///
-/// let _snapshot = world.snapshot();
+/// let _snapshot = world.latest();
 /// # }
 /// ```
 #[derive(Debug)]
@@ -194,14 +198,136 @@ pub struct World {
 impl World {
     /// Returns the latest internally consistent snapshot without waiting.
     #[must_use]
-    pub fn snapshot(&self) -> Arc<Snapshot> {
+    pub fn latest(&self) -> Arc<Snapshot> {
         Arc::clone(&self.snapshots.borrow())
     }
 
-    /// Subscribes to future canonical snapshot revisions.
+    /// Atomically captures the latest snapshot and future revisions.
+    ///
+    /// [`Subscription::latest`] and the first [`Subscription::changed`] call
+    /// meet without a gap or duplicate revision.
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
-        self.snapshots.clone()
+    pub fn subscribe(&self) -> Subscription {
+        let mut snapshots = self.snapshots.clone();
+        let latest = Arc::clone(&snapshots.borrow_and_update());
+
+        Subscription { latest, snapshots }
+    }
+
+    /// Prepares to resolve a pure world [`Query`] over current and future
+    /// revisions.
+    pub fn wait<Q>(&self, query: Q) -> Wait<'static, Q>
+    where
+        Q: Query,
+    {
+        Wait {
+            source: Source::Owned(self.subscribe()),
+            query,
+        }
+    }
+}
+
+/// Gap-free view of one current snapshot followed by future revisions.
+#[derive(Debug)]
+pub struct Subscription {
+    latest: Arc<Snapshot>,
+    snapshots: watch::Receiver<Arc<Snapshot>>,
+}
+
+impl Subscription {
+    /// Returns the latest snapshot observed by this subscription.
+    #[must_use]
+    pub fn latest(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.latest)
+    }
+
+    /// Waits for and returns the next canonical snapshot revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::Closed`] when the engine owner stops.
+    pub async fn changed(&mut self) -> Result<Arc<Snapshot>, SubscriptionError> {
+        self.snapshots
+            .changed()
+            .await
+            .map_err(|_| SubscriptionError::Closed)?;
+        self.latest = Arc::clone(&self.snapshots.borrow_and_update());
+
+        Ok(self.latest())
+    }
+
+    /// Prepares to resolve a [`Query`] without losing this subscription's
+    /// current revision fence.
+    pub fn wait<Q>(&mut self, query: Q) -> Wait<'_, Q>
+    where
+        Q: Query,
+    {
+        Wait {
+            source: Source::Borrowed(self),
+            query,
+        }
+    }
+}
+
+/// A lazy query wait over current and future world revisions.
+#[derive(Debug)]
+#[must_use = "a world wait has no effect until run or within is awaited"]
+pub struct Wait<'a, Q> {
+    source: Source<'a>,
+    query: Q,
+}
+
+impl<Q> Wait<'_, Q>
+where
+    Q: Query,
+{
+    /// Waits without a deadline until the query resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError::Closed`] when the engine owner stops first.
+    pub async fn run(mut self) -> Result<Q::Output, WaitError> {
+        loop {
+            if let State::Ready(value) = self.query.evaluate(&self.source.latest()) {
+                return Ok(value);
+            }
+
+            self.source.changed().await?;
+        }
+    }
+
+    /// Waits up to `duration` for the query to resolve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError::Elapsed`] when the deadline passes or
+    /// [`WaitError::Closed`] when the engine owner stops first.
+    pub async fn within(self, duration: Duration) -> Result<Q::Output, WaitError> {
+        tokio::time::timeout(duration, self.run())
+            .await
+            .map_err(|_| WaitError::Elapsed { duration })?
+    }
+}
+
+#[derive(Debug)]
+enum Source<'a> {
+    Owned(Subscription),
+    Borrowed(&'a mut Subscription),
+}
+
+impl Source<'_> {
+    fn latest(&self) -> Arc<Snapshot> {
+        match self {
+            Self::Owned(subscription) => subscription.latest(),
+            Self::Borrowed(subscription) => subscription.latest(),
+        }
+    }
+
+    async fn changed(&mut self) -> Result<Arc<Snapshot>, SubscriptionError> {
+        match self {
+            Self::Owned(subscription) => subscription.changed().await,
+            Self::Borrowed(subscription) => subscription.changed().await,
+        }
     }
 }
 
@@ -292,9 +418,40 @@ pub enum Error {
     Stopped,
 }
 
+/// Failure while advancing an atomic [`Subscription`].
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SubscriptionError {
+    /// The engine owner stopped before another revision was published.
+    #[error("canonical world subscription is closed")]
+    Closed,
+}
+
+impl From<SubscriptionError> for WaitError {
+    fn from(error: SubscriptionError) -> Self {
+        match error {
+            SubscriptionError::Closed => Self::Closed,
+        }
+    }
+}
+
+/// Failure while waiting for a world [`Query`].
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum WaitError {
+    /// The engine owner stopped before the query resolved.
+    #[error("canonical world closed before the query resolved")]
+    Closed,
+    /// The query remained pending for the complete deadline.
+    #[error("world query did not resolve within {duration:?}")]
+    Elapsed {
+        /// Configured wait duration.
+        duration: Duration,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use viperzoo_protocol::{decode, direction::Flow, primitive::Position};
+    use viperzoo_world::{query, revision::Revision};
 
     use super::*;
 
@@ -314,7 +471,7 @@ mod tests {
 
         assert!(receipt.change().is_projected());
         assert_eq!(
-            world.snapshot().player().location().position(),
+            world.latest().player().location().position(),
             Some(Position::new(3, 1))
         );
 
@@ -336,7 +493,56 @@ mod tests {
             .expect("engine is running");
         snapshots.changed().await.expect("publisher is alive");
 
-        assert_eq!(snapshots.borrow().revision().value(), 1);
+        assert_eq!(snapshots.latest().revision().value(), 1);
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn subscription_snapshot_and_future_revisions_meet_without_a_gap() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+
+        ingress
+            .observe(Observation::SessionStarted)
+            .await
+            .expect("engine is running");
+
+        let mut subscription = world.subscribe();
+        assert_eq!(subscription.latest().revision().value(), 1);
+
+        ingress
+            .observe(Observation::TransportClosed)
+            .await
+            .expect("engine is running");
+        let changed = subscription.changed().await.expect("publisher is alive");
+        assert_eq!(changed.revision().value(), 2);
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn queries_resolve_immediately_from_the_atomic_current_snapshot() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+
+        ingress
+            .observe(Observation::SessionStarted)
+            .await
+            .expect("engine is running");
+
+        let revision = world
+            .wait(query::after(Revision::INITIAL))
+            .within(Duration::from_millis(10))
+            .await
+            .expect("current snapshot already resolves the query");
+        assert_eq!(revision.value(), 1);
 
         drop(ingress);
         owner.await.expect("engine owner does not panic");
@@ -352,6 +558,6 @@ mod tests {
         drop(ingress);
         owner.await.expect("engine owner does not panic");
 
-        assert_eq!(world.snapshot().revision().value(), 0);
+        assert_eq!(world.latest().revision().value(), 0);
     }
 }

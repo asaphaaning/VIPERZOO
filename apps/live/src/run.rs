@@ -73,7 +73,7 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
         if bytes_read == 0 {
             if pending.is_empty() && phase == Phase::CatchingUp {
                 phase = Phase::Following;
-                let snapshot = world.snapshot();
+                let snapshot = world.latest();
                 publish_ready(&mut output, config.output(), &snapshot).await?;
                 tracing::info!(
                     revision = snapshot.revision().value(),
@@ -142,7 +142,7 @@ async fn publish_record(
 
     match (phase, change) {
         (Phase::Following, Change::Projected(revision)) => {
-            let snapshot = world.snapshot();
+            let snapshot = world.latest();
 
             match detail {
                 Output::Summary => {
