@@ -14,7 +14,7 @@ use viperzoo_capture::{
     line::Line,
     record::{self, Record},
 };
-use viperzoo_engine::{self, Handle};
+use viperzoo_engine::{self, Ingress, World};
 use viperzoo_world::world::Change;
 
 use crate::{
@@ -52,8 +52,10 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
     }
 
     let mut output = BufWriter::new(tokio::io::stdout());
-    let (engine, owner) = viperzoo_engine::channel(viperzoo_engine::Config::default());
-    let _owner = tokio::spawn(owner.run());
+    let channel = viperzoo_engine::channel(viperzoo_engine::Config::default());
+    let ingress = channel.ingress();
+    let world = channel.world();
+    let _owner = tokio::spawn(channel.owner().run());
     let mut phase = Phase::CatchingUp;
     let mut pending = String::new();
     let mut line = Line::FIRST;
@@ -71,7 +73,7 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
         if bytes_read == 0 {
             if pending.is_empty() && phase == Phase::CatchingUp {
                 phase = Phase::Following;
-                let snapshot = engine.snapshot();
+                let snapshot = world.snapshot();
                 publish_ready(&mut output, config.output(), &snapshot).await?;
                 tracing::info!(
                     revision = snapshot.revision().value(),
@@ -91,7 +93,8 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
         publish_record(
             &mut output,
             config.output(),
-            &engine,
+            &ingress,
+            &world,
             phase,
             record::decode(line, input),
         )
@@ -104,7 +107,7 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
 
 #[instrument(
     name = "viperzoo::live::publish_record",
-    skip(output, engine, record),
+    skip(output, ingress, world, record),
     fields(phase = ?phase, detail = ?detail),
     err,
     ret(level = "debug")
@@ -112,7 +115,8 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
 async fn publish_record(
     output: &mut BufWriter<tokio::io::Stdout>,
     detail: Output,
-    engine: &Handle,
+    ingress: &Ingress,
+    world: &World,
     phase: Phase,
     record: Record,
 ) -> Result<(), Error> {
@@ -134,11 +138,11 @@ async fn publish_record(
         }
         Record::Skipped => return Ok(()),
     };
-    let change = engine.observe(observation).await?.change();
+    let change = ingress.observe(observation).await?.change();
 
     match (phase, change) {
         (Phase::Following, Change::Projected(revision)) => {
-            let snapshot = engine.snapshot();
+            let snapshot = world.snapshot();
 
             match detail {
                 Output::Summary => {
@@ -238,7 +242,7 @@ pub enum Error {
     /// A typed engine event could not be published.
     #[error(transparent)]
     Message(#[from] message::Error),
-    /// The canonical projection owner stopped unexpectedly.
+    /// Canonical observation ingress stopped unexpectedly.
     #[error(transparent)]
-    Engine(#[from] viperzoo_engine::Error),
+    Ingress(#[from] viperzoo_engine::Error),
 }

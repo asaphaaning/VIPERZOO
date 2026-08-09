@@ -20,13 +20,15 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
     ret(level = "debug")
 )]
 pub async fn run(config: Config) -> Result<(), Error> {
-    let (engine, owner) = viperzoo_engine::channel(viperzoo_engine::Config::default());
-    let owner = tokio::spawn(owner.run());
+    let channel = viperzoo_engine::channel(viperzoo_engine::Config::default());
+    let ingress = channel.ingress();
+    let world = channel.world();
+    let owner = tokio::spawn(channel.owner().run());
     let adapter_config = frida::Config::new(config.target().clone())
         .with_agent(config.agent().clone())
         .with_recording(config.recording().clone());
-    let attachment = frida::attach(adapter_config, engine.clone())?;
-    let mut snapshots = engine.subscribe();
+    let attachment = frida::attach(adapter_config, ingress.clone())?;
+    let mut snapshots = world.subscribe();
     let mut ticker = time::interval(EVENT_POLL_INTERVAL);
 
     let stop = loop {
@@ -42,7 +44,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 break Stop::Interrupted;
             }
             result = snapshots.changed() => {
-                result.map_err(|_| Error::EngineStopped)?;
+                result.map_err(|_| Error::WorldStopped)?;
                 print_summary(&snapshots.borrow());
             }
             _ = ticker.tick() => {}
@@ -54,11 +56,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
         Stop::Interrupted => attachment.stop().await,
         Stop::Detached => attachment.wait().await,
     };
-    let shutdown = engine.shutdown().await;
+    drop(ingress);
     let owner = owner.await;
 
     adapter?;
-    shutdown?;
     owner?;
 
     Ok(())
@@ -151,12 +152,9 @@ pub enum Error {
     /// Direct Frida acquisition failed.
     #[error(transparent)]
     Frida(#[from] frida::Error),
-    /// The canonical engine stopped unexpectedly.
-    #[error(transparent)]
-    Engine(#[from] viperzoo_engine::Error),
     /// The canonical snapshot publisher stopped unexpectedly.
-    #[error("canonical engine snapshot stream stopped")]
-    EngineStopped,
+    #[error("canonical world stream stopped")]
+    WorldStopped,
     /// The canonical engine owner panicked.
     #[error("canonical engine owner failed: {0}")]
     Owner(#[from] tokio::task::JoinError),

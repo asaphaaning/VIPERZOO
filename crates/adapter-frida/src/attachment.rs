@@ -33,7 +33,7 @@ use viperzoo_adapter_api::{
     observation::Observation,
     resource::{self, Pool, Resources},
 };
-use viperzoo_engine::Handle;
+use viperzoo_engine::Ingress;
 use viperzoo_protocol::{map as protocol, primitive::MapId};
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM},
@@ -223,12 +223,12 @@ impl Drop for Attachment {
 /// or [`Attachment::stop`].
 #[instrument(
     name = "viperzoo::adapter::frida::attach",
-    skip(engine),
+    skip(ingress),
     fields(target = ?config.target()),
     err,
     ret(level = "debug")
 )]
-pub fn attach(config: Config, engine: Handle) -> Result<Attachment, Error> {
+pub fn attach(config: Config, ingress: Ingress) -> Result<Attachment, Error> {
     let (commands, command_receiver) = mpsc::channel();
     let (events, event_receiver) = mpsc::channel();
     // Frida's session graph is non-Send. One long-lived OS thread is the
@@ -236,7 +236,7 @@ pub fn attach(config: Config, engine: Handle) -> Result<Attachment, Error> {
     // wait, controller, timer, and application task outside this island.
     let thread = thread::Builder::new()
         .name("viperzoo-frida".into())
-        .spawn(move || run(config, engine, command_receiver, events))
+        .spawn(move || run(config, ingress, command_receiver, events))
         .map_err(Error::ThreadStart)?;
 
     Ok(Attachment {
@@ -248,12 +248,12 @@ pub fn attach(config: Config, engine: Handle) -> Result<Attachment, Error> {
 
 #[instrument(
     name = "viperzoo::adapter::frida::run",
-    skip(config, engine, commands, events),
+    skip(config, ingress, commands, events),
     err
 )]
 fn run(
     config: Config,
-    engine: Handle,
+    ingress: Ingress,
     commands: Receiver<Command>,
     events: Sender<Event>,
 ) -> Result<(), Error> {
@@ -277,18 +277,18 @@ fn run(
     let mut script = session.create_script(&source, &mut options)?;
 
     script.handle_message(Handler::new(
-        engine.clone(),
+        ingress.clone(),
         events.clone(),
         info.clone(),
         recorder,
     ))?;
-    engine.observe_blocking(Observation::SessionStarted)?;
+    ingress.observe_blocking(Observation::SessionStarted)?;
     script.load()?;
 
     match script.exports.call("clientResources", None)? {
         Some(value) => match resource_snapshot(value) {
             Ok(Some(resources)) => {
-                engine.observe_blocking(Observation::PlayerResources(resources))?;
+                ingress.observe_blocking(Observation::PlayerResources(resources))?;
                 let _ = events.send(Event::ResourcesSeeded(resources));
             }
             Ok(None) => {}
@@ -303,8 +303,8 @@ fn run(
         }
     }
 
-    seed_inventory(&mut script, &engine, &events)?;
-    seed_map_identity(&mut script, &engine, &events)?;
+    seed_inventory(&mut script, &ingress, &events)?;
+    seed_map_identity(&mut script, &ingress, &events)?;
 
     let _ = events.send(Event::Attached(info));
 
@@ -335,7 +335,7 @@ fn run(
 
 fn seed_inventory(
     script: &mut frida::Script<'_>,
-    engine: &Handle,
+    ingress: &Ingress,
     events: &Sender<Event>,
 ) -> Result<(), Error> {
     for attempt in 1..=INVENTORY_SEED_ATTEMPTS {
@@ -346,7 +346,7 @@ fn seed_inventory(
                 let capacity = inventory.capacity();
                 let occupied = inventory.items().len();
 
-                engine.observe_blocking(Observation::PlayerInventory(inventory))?;
+                ingress.observe_blocking(Observation::PlayerInventory(inventory))?;
                 let _ = events.send(Event::InventorySeeded { capacity, occupied });
                 return Ok(());
             }
@@ -604,7 +604,7 @@ fn agent_config() -> serde_json::Value {
 /// rather than a bare number that any two bytes could imitate.
 fn seed_map_identity(
     script: &mut frida::Script<'_>,
-    engine: &Handle,
+    ingress: &Ingress,
     events: &Sender<Event>,
 ) -> Result<(), Error> {
     let reply = script
@@ -643,7 +643,7 @@ fn seed_map_identity(
                 title = ?title,
                 "map identity seeded from client memory"
             );
-            engine.observe_blocking(Observation::ClientMap {
+            ingress.observe_blocking(Observation::ClientMap {
                 identity,
                 title: title.map(|title| title.to_string()),
             })?;
@@ -885,9 +885,9 @@ pub enum Error {
     /// The official Frida binding rejected a lifecycle operation.
     #[error(transparent)]
     Frida(#[from] frida::Error),
-    /// The canonical engine stopped while the adapter was attached.
+    /// Canonical observation ingress stopped while the adapter was attached.
     #[error(transparent)]
-    Engine(#[from] viperzoo_engine::Error),
+    Ingress(#[from] viperzoo_engine::Error),
 }
 
 #[cfg(test)]

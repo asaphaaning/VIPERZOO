@@ -1,11 +1,11 @@
 //! Project the live engine into a browser as a read-only diagnostic console.
 //!
-//! An application that already owns an [`engine::Handle`] can start this
+//! An application that already owns an [`engine::World`] can start this
 //! alongside its normal work and then watch the same world state, and the same
 //! tracing output, from any machine on the network.
 //!
 //! ```text
-//!  engine::Handle ──subscribe──► snapshot ──project──► Event::World ─┐
+//!  engine::World ──subscribe──► snapshot ──project──► Event::World ─┐
 //!                                                                    ├─► /events ─► browser
 //!  tracing fmt::layer(stdout) ── web::trace::Layer ──► Event::Trace ─┘
 //!                                                                    └─► /  (console page)
@@ -19,7 +19,7 @@
 //! # Example
 //!
 //! ```no_run
-//! # async fn example(engine: viperzoo_engine::Handle) -> Result<(), viperzoo_web::Error> {
+//! # async fn example(world: viperzoo_engine::World) -> Result<(), viperzoo_web::Error> {
 //! use tracing_subscriber::prelude::*;
 //!
 //! let console = viperzoo_web::Console::new();
@@ -29,7 +29,7 @@
 //!     .with(console.layer())
 //!     .init();
 //!
-//! console.serve(engine, None, "0.0.0.0:7878".parse().unwrap(), None).await
+//! console.serve(world, None, "0.0.0.0:7878".parse().unwrap(), None).await
 //! # }
 //! ```
 
@@ -61,7 +61,7 @@ use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt as _, wrappers::BroadcastStream};
 use tracing::{debug, info, instrument};
 use viperzoo_assets::Catalog;
-use viperzoo_engine::Handle;
+use viperzoo_engine::World as EngineWorld;
 
 use crate::{event::Event, projection::World};
 
@@ -139,12 +139,12 @@ impl Console {
     /// server fails.
     #[instrument(
         name = "viperzoo::web::serve",
-        skip(self, engine, assets, controls),
+        skip(self, world, assets, controls),
         err
     )]
     pub async fn serve(
         &self,
-        engine: Handle,
+        world: EngineWorld,
         assets: Option<Catalog>,
         address: SocketAddr,
         controls: Option<control::Controls>,
@@ -152,7 +152,7 @@ impl Console {
         let state = Shared {
             events: self.events.clone(),
             history: Arc::clone(&self.history),
-            engine: engine.clone(),
+            world: world.clone(),
             assets: assets.clone(),
             controls,
         };
@@ -161,7 +161,7 @@ impl Console {
         // broadcasting keeps a second viewer from doubling the work, and keeps
         // world frames from crowding out tracing on a busy session.
         tokio::spawn(publish(
-            engine,
+            world,
             assets,
             self.events.clone(),
             state.controls.clone(),
@@ -189,7 +189,7 @@ impl Console {
 struct Shared {
     events: broadcast::Sender<Event>,
     history: Arc<Mutex<VecDeque<event::Trace>>>,
-    engine: Handle,
+    world: EngineWorld,
     assets: Option<Catalog>,
     controls: Option<control::Controls>,
 }
@@ -225,12 +225,12 @@ async fn signal(
 /// each carrying the full tile and entity set. Nobody reads that fast, so
 /// revisions are coalesced into one projection per [`WORLD_INTERVAL`].
 async fn publish(
-    engine: Handle,
+    world: EngineWorld,
     assets: Option<Catalog>,
     events: broadcast::Sender<Event>,
     controls: Option<control::Controls>,
 ) {
-    let mut snapshots = engine.subscribe();
+    let mut snapshots = world.subscribe();
 
     loop {
         if snapshots.changed().await.is_err() {
@@ -261,7 +261,7 @@ async fn events(
     State(shared): State<Shared>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
     let initial = World::project(
-        &shared.engine.snapshot(),
+        &shared.world.snapshot(),
         shared.assets.as_ref(),
         shared.controls.as_ref().map(control::Controls::state),
     );

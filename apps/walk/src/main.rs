@@ -41,11 +41,13 @@ async fn main() -> ExitCode {
     ret(level = "debug")
 )]
 async fn run(config: cli::Config) -> Result<(), Error> {
-    let (engine, task) = engine::channel(engine::Config::default());
-    let owner = tokio::spawn(task.run());
+    let channel = engine::channel(engine::Config::default());
+    let ingress = channel.ingress();
+    let world = channel.world();
+    let owner = tokio::spawn(channel.owner().run());
     let attachment = frida::attach(
         frida::Config::new(config.client().clone()).with_recording(config.recording().clone()),
-        engine.clone(),
+        ingress.clone(),
     )?;
     let control = attachment.control();
     let target = Position::new(config.x(), config.y());
@@ -57,7 +59,7 @@ async fn run(config: cli::Config) -> Result<(), Error> {
     );
     let result = actions::walk::to_with_assets(
         &control,
-        &engine,
+        &world,
         &assets,
         target,
         actions::walk::Config::default(),
@@ -65,12 +67,11 @@ async fn run(config: cli::Config) -> Result<(), Error> {
     .await;
 
     let adapter = attachment.stop().await;
-    let shutdown = engine.shutdown().await;
+    drop(ingress);
     let owner = owner.await;
     let report = result?;
 
     adapter?;
-    shutdown?;
     owner?;
 
     info!(
@@ -91,8 +92,6 @@ enum Error {
     Frida(#[from] frida::Error),
     #[error(transparent)]
     Walk(#[from] actions::walk::Error<frida::ActionError>),
-    #[error(transparent)]
-    Engine(#[from] engine::Error),
     #[error("engine owner failed: {0}")]
     Owner(#[from] tokio::task::JoinError),
     #[error(transparent)]

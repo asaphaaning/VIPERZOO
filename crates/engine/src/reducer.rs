@@ -1,6 +1,6 @@
 //! Run the engine’s deterministic form without asynchronous ownership.
 //!
-//! [`Reducer`] is the replay-friendly counterpart to [`crate::Task`]. Each
+//! [`Reducer`] is the replay-friendly counterpart to [`crate::Owner`]. Each
 //! [`viperzoo_adapter_api::observation::Observation`] is reduced immediately in
 //! caller order, making the resulting [`viperzoo_world::snapshot::Snapshot`]
 //! reproducible in tests and finite input analysis. It deliberately does not

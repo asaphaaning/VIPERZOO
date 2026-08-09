@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 use viperzoo_adapter_api::observation::Observation;
-use viperzoo_engine::Handle;
+use viperzoo_engine::Ingress;
 use viperzoo_protocol::{decode, direction::Flow};
 
 use crate::{
@@ -28,7 +28,7 @@ pub(crate) const SOURCE: &str = include_str!("agent.js");
 
 #[derive(Debug)]
 pub(crate) struct Handler {
-    engine: Handle,
+    ingress: Ingress,
     events: Sender<Event>,
     info: Info,
     recorder: Recorder,
@@ -36,13 +36,13 @@ pub(crate) struct Handler {
 
 impl Handler {
     pub(crate) fn new(
-        engine: Handle,
+        ingress: Ingress,
         events: Sender<Event>,
         info: Info,
         recorder: Recorder,
     ) -> Self {
         Self {
-            engine,
+            ingress,
             events,
             info,
             recorder,
@@ -142,7 +142,7 @@ impl Handler {
             ));
         }
 
-        if let Err(error) = self.engine.observe_blocking(Observation::TransportClosed) {
+        if let Err(error) = self.ingress.observe_blocking(Observation::TransportClosed) {
             self.send(Event::Rejected(Rejection::new(None, 0, error.to_string())));
             return;
         }
@@ -231,7 +231,7 @@ impl Handler {
             }
         };
 
-        if let Err(error) = self.engine.observe_blocking(packet.into()) {
+        if let Err(error) = self.ingress.observe_blocking(packet.into()) {
             self.send(Event::Rejected(Rejection::new(
                 Some(flow),
                 data.len(),

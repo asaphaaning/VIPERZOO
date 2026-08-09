@@ -1,9 +1,10 @@
 //! Serialize live observations through one bounded asynchronous owner.
 //!
-//! [`Handle`] is cloneable so adapters and controllers can submit observations
-//! concurrently. [`Task`] receives them through a bounded channel, applies
-//! them in order through [`crate::Reducer`], replies with a [`Receipt`], and
-//! publishes only complete `Arc<Snapshot>` revisions through a watch channel.
+//! [`Channel`] separates the three capabilities of a live engine. Cloneable
+//! [`Ingress`] values submit observations, cloneable [`World`] values read
+//! immutable snapshots, and one [`Owner`] reduces every accepted observation.
+//! The types make observation authority, knowledge access, and runtime
+//! ownership distinct instead of granting all three to every caller.
 //!
 //! Backpressure is intentional: an acquisition boundary must slow down rather
 //! than let an unbounded queue hide lost responsiveness or memory growth.
@@ -60,19 +61,63 @@ impl Receipt {
     }
 }
 
-/// Cloneable command and snapshot handle for a running [`Task`].
-#[derive(Clone, Debug)]
-pub struct Handle {
-    commands: mpsc::Sender<Command>,
-    snapshots: watch::Receiver<Arc<Snapshot>>,
+/// The connected capabilities of one live engine.
+///
+/// Clone the capabilities needed by each participant before consuming the
+/// channel with [`Channel::owner`]:
+///
+/// ```no_run
+/// # async fn run() {
+/// let channel = viperzoo_engine::channel(viperzoo_engine::Config::default());
+/// let ingress = channel.ingress();
+/// let world = channel.world();
+/// let owner = tokio::spawn(channel.owner().run());
+///
+/// drop(ingress);
+/// owner.await.expect("engine owner does not panic");
+///
+/// let _snapshot = world.snapshot();
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "the engine channel must be divided into the capabilities its runtime needs"]
+pub struct Channel {
+    ingress: Ingress,
+    world: World,
+    owner: Owner,
 }
 
-impl Handle {
+impl Channel {
+    /// Returns a cloneable observation capability.
+    #[must_use]
+    pub fn ingress(&self) -> Ingress {
+        self.ingress.clone()
+    }
+
+    /// Returns a cloneable canonical-world capability.
+    #[must_use]
+    pub fn world(&self) -> World {
+        self.world.clone()
+    }
+
+    /// Consumes the channel and returns its single runtime owner.
+    pub fn owner(self) -> Owner {
+        self.owner
+    }
+}
+
+/// Cloneable authority to submit observations to a running [`Owner`].
+#[derive(Clone, Debug)]
+pub struct Ingress {
+    commands: mpsc::Sender<Command>,
+}
+
+impl Ingress {
     /// Orders one observation and waits until it is reflected in snapshots.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Stopped`] if the owner [`Task`] has stopped.
+    /// Returns [`Error::Stopped`] if the [`Owner`] has stopped.
     #[instrument(
         name = "viperzoo::engine::observe",
         skip(self, observation),
@@ -99,11 +144,11 @@ impl Handle {
     /// # Panics
     ///
     /// Panics when called from within an asynchronous Tokio execution context.
-    /// Use [`Handle::observe`] there instead.
+    /// Use [`Ingress::observe`] there instead.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Stopped`] if the owner [`Task`] has stopped.
+    /// Returns [`Error::Stopped`] if the [`Owner`] has stopped.
     #[instrument(
         name = "viperzoo::engine::observe_blocking",
         skip(self, observation),
@@ -123,7 +168,15 @@ impl Handle {
 
         receipt.blocking_recv().map_err(|_| Error::Stopped)
     }
+}
 
+/// Cloneable read access to the canonical world of a running [`Owner`].
+#[derive(Clone, Debug)]
+pub struct World {
+    snapshots: watch::Receiver<Arc<Snapshot>>,
+}
+
+impl World {
     /// Returns the latest internally consistent snapshot without waiting.
     #[must_use]
     pub fn snapshot(&self) -> Arc<Snapshot> {
@@ -135,39 +188,23 @@ impl Handle {
     pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
         self.snapshots.clone()
     }
-
-    /// Requests an orderly engine stop after all prior commands.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Stopped`] if the owner [`Task`] has already stopped.
-    #[instrument(
-        name = "viperzoo::engine::shutdown",
-        skip(self),
-        err,
-        ret(level = "debug")
-    )]
-    pub async fn shutdown(&self) -> Result<(), Error> {
-        self.commands
-            .send(Command::Shutdown)
-            .await
-            .map_err(|_| Error::Stopped)
-    }
 }
 
-/// Lazy single-owner engine task.
+/// Lazy single-owner engine runtime.
 ///
-/// Nothing is reduced until [`Task::run`] is awaited or spawned.
+/// Nothing is reduced until [`Owner::run`] is awaited or spawned. The owner
+/// drains every accepted observation and finishes after the last [`Ingress`]
+/// is dropped.
 #[derive(Debug)]
-#[must_use = "the engine task must be run for its handle to make progress"]
-pub struct Task {
+#[must_use = "the engine owner must be run for its ingress to make progress"]
+pub struct Owner {
     commands: mpsc::Receiver<Command>,
     snapshots: watch::Sender<Arc<Snapshot>>,
     reducer: Reducer,
 }
 
-impl Task {
-    /// Owns and reduces observations until shutdown or the last [`Handle`] is dropped.
+impl Owner {
+    /// Reduces observations until every [`Ingress`] has been dropped.
     #[instrument(name = "viperzoo::engine::run", skip(self))]
     pub async fn run(mut self) {
         while let Some(command) = self.commands.recv().await {
@@ -184,34 +221,33 @@ impl Task {
                         "ordered observation reduced"
                     );
                 }
-                Command::Shutdown => break,
             }
         }
     }
 }
 
-/// Creates a connected [`Handle`] and lazy owner [`Task`].
+/// Creates the connected capabilities of one live engine.
 #[instrument(
     name = "viperzoo::engine::channel",
     fields(capacity = config.capacity().get()),
     ret(level = "trace")
 )]
-pub fn channel(config: Config) -> (Handle, Task) {
+pub fn channel(config: Config) -> Channel {
     let reducer = Reducer::new();
     let (commands, receiver) = mpsc::channel(config.capacity().get());
     let (snapshots, subscription) = watch::channel(Arc::new(reducer.snapshot()));
 
-    (
-        Handle {
-            commands,
+    Channel {
+        ingress: Ingress { commands },
+        world: World {
             snapshots: subscription,
         },
-        Task {
+        owner: Owner {
             commands: receiver,
             snapshots,
             reducer,
         },
-    )
+    }
 }
 
 const fn observation_name(observation: &Observation) -> &'static str {
@@ -231,14 +267,13 @@ enum Command {
         observation: Box<Observation>,
         reply: oneshot::Sender<Receipt>,
     },
-    Shutdown,
 }
 
 /// Engine command failure.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// The owner task stopped before accepting or acknowledging the command.
-    #[error("engine task has stopped")]
+    /// The owner stopped before accepting or acknowledging the observation.
+    #[error("engine owner has stopped")]
     Stopped,
 }
 
@@ -250,33 +285,37 @@ mod tests {
 
     #[tokio::test]
     async fn observations_are_acknowledged_after_snapshot_publication() {
-        let (handle, task) = channel(Config::default());
-        let owner = tokio::spawn(task.run());
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
         let bytes = hex::decode("04000300010003000100410000").expect("fixture hex is valid");
         let packet = decode(Flow::Clientbound, &bytes).expect("fixture packet is valid");
 
-        let receipt = handle
+        let receipt = ingress
             .observe(packet.into())
             .await
             .expect("engine is running");
 
         assert!(receipt.change().is_projected());
         assert_eq!(
-            handle.snapshot().player().location().position(),
+            world.snapshot().player().location().position(),
             Some(Position::new(3, 1))
         );
 
-        handle.shutdown().await.expect("engine is running");
-        owner.await.expect("engine task does not panic");
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
     }
 
     #[tokio::test]
-    async fn subscribers_receive_each_canonical_revision() {
-        let (handle, task) = channel(Config::default());
-        let owner = tokio::spawn(task.run());
-        let mut snapshots = handle.subscribe();
+    async fn subscribers_receive_the_latest_published_revision() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+        let mut snapshots = world.subscribe();
 
-        handle
+        ingress
             .observe(Observation::SessionStarted)
             .await
             .expect("engine is running");
@@ -284,7 +323,20 @@ mod tests {
 
         assert_eq!(snapshots.borrow().revision().value(), 1);
 
-        handle.shutdown().await.expect("engine is running");
-        owner.await.expect("engine task does not panic");
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn world_readers_do_not_keep_the_owner_alive() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+
+        assert_eq!(world.snapshot().revision().value(), 0);
     }
 }
