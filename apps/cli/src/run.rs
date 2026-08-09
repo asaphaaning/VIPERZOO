@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::time;
 use tracing::{info, instrument, warn};
 use viperzoo_adapter_frida::{self as frida, Event};
-use viperzoo_world::snapshot::Snapshot;
+use viperzoo_sdk::{Session, world::snapshot::Snapshot};
 
 use crate::cli::Config;
 
@@ -20,23 +20,23 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
     ret(level = "debug")
 )]
 pub async fn run(config: Config) -> Result<(), Error> {
-    let channel = viperzoo_engine::channel(viperzoo_engine::Config::default());
-    let ingress = channel.ingress();
-    let world = channel.world();
-    let owner = tokio::spawn(channel.owner().run());
     let adapter_config = frida::Config::new(config.target().clone())
         .with_agent(config.agent().clone())
         .with_recording(config.recording().clone());
-    let running = frida::attach(adapter_config, ingress.clone())?;
-    let mut events = running.events;
-    let driver = running.driver;
+    let session = Session::builder(frida::Adapter::new(adapter_config))
+        .start()
+        .await?;
+    let _client = session.client;
+    let mut events = session.events;
+    let world = session.world;
+    let owner = session.owner;
     let mut snapshots = world.subscribe();
     let mut ticker = time::interval(EVENT_POLL_INTERVAL);
 
     let stop = loop {
         drain_events(&mut events);
 
-        if driver.is_finished() {
+        if owner.is_finished() {
             break Stop::Detached;
         }
 
@@ -54,15 +54,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
     };
 
     drain_events(&mut events);
-    let adapter = match stop {
-        Stop::Interrupted => driver.shutdown().await,
-        Stop::Detached => driver.wait().await,
-    };
-    drop(ingress);
-    let owner = owner.await;
-
-    adapter?;
-    owner?;
+    match stop {
+        Stop::Interrupted => owner.shutdown().await?,
+        Stop::Detached => owner.wait().await?,
+    }
 
     Ok(())
 }
@@ -129,7 +124,7 @@ fn print_summary(snapshot: &Snapshot) {
         packets = snapshot.processed_packet_count(),
         unknown = snapshot.unknown_packet_count(),
         map_id = map.map(|context| context.id().value()),
-        map_title = map.map(viperzoo_world::map::Context::title),
+        map_title = map.map(viperzoo_sdk::world::map::Context::title),
         x = position.map(|position| position.x().value()),
         y = position.map(|position| position.y().value()),
         vita = vita.current().value(),
@@ -151,15 +146,12 @@ enum Stop {
 /// Fatal standalone engine failure.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Direct Frida acquisition failed.
+    /// Session startup or teardown failed.
     #[error(transparent)]
-    Frida(#[from] frida::Error),
+    Session(#[from] viperzoo_sdk::Error<frida::Error>),
     /// The canonical snapshot publisher stopped unexpectedly.
     #[error("canonical world stream stopped")]
     WorldStopped,
-    /// The canonical engine owner panicked.
-    #[error("canonical engine owner failed: {0}")]
-    Owner(#[from] tokio::task::JoinError),
     /// The terminal signal handler could not be installed.
     #[error("unable to listen for Ctrl+C: {0}")]
     Signal(#[from] std::io::Error),

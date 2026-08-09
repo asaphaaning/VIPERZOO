@@ -17,8 +17,7 @@ tokio = { workspace = true, features = [
 tracing.workspace = true
 tracing-subscriber.workspace = true
 viperzoo-adapter-frida = { version = "0.1.0", path = "../../crates/adapter-frida" }
-viperzoo-engine = { version = "0.1.0", path = "../../crates/engine" }
-viperzoo-world = { version = "0.1.0", path = "../../crates/world" }
+viperzoo-sdk = { version = "0.1.0", path = "../../crates/sdk" }
 
 [lints]
 workspace = true

@@ -1452,8 +1452,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "viperzoo-adapter-frida",
- "viperzoo-engine",
- "viperzoo-world",
+ "viperzoo-sdk",
 ]
 
 [[package]]
@@ -1592,6 +1591,10 @@ dependencies = [
 name = "viperzoo-sdk"
 version = "0.1.0"
 dependencies = [
+ "futures-core",
+ "thiserror",
+ "tokio",
+ "tracing",
  "viperzoo-actions",
  "viperzoo-adapter-api",
  "viperzoo-assets",
