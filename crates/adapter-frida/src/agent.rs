@@ -9,14 +9,12 @@
 //! It also writes optional evidence records beside direct delivery, so recording
 //! failure can be reported without interrupting the live projection path.
 
-use std::sync::mpsc::Sender;
-
 use frida::{Message as FridaMessage, ScriptHandler};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
-use viperzoo_adapter_api::observation::Observation;
-use viperzoo_engine::Ingress;
+use viperzoo_adapter_api::observation::{self, Observation};
 use viperzoo_protocol::{decode, direction::Flow};
 
 use crate::{
@@ -27,17 +25,20 @@ use crate::{
 pub(crate) const SOURCE: &str = include_str!("agent.js");
 
 #[derive(Debug)]
-pub(crate) struct Handler {
-    ingress: Ingress,
-    events: Sender<Event>,
+pub(crate) struct Handler<S> {
+    ingress: S,
+    events: UnboundedSender<Event>,
     info: Info,
     recorder: Recorder,
 }
 
-impl Handler {
+impl<S> Handler<S>
+where
+    S: observation::Sink,
+{
     pub(crate) fn new(
-        ingress: Ingress,
-        events: Sender<Event>,
+        ingress: S,
+        events: UnboundedSender<Event>,
         info: Info,
         recorder: Recorder,
     ) -> Self {
@@ -241,7 +242,10 @@ impl Handler {
     }
 }
 
-impl ScriptHandler for Handler {
+impl<S> ScriptHandler for Handler<S>
+where
+    S: observation::Sink,
+{
     fn on_message(&mut self, message: FridaMessage, data: Option<Vec<u8>>) {
         self.handle(message, data.as_deref());
     }

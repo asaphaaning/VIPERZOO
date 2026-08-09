@@ -45,11 +45,13 @@ async fn run(config: cli::Config) -> Result<(), Error> {
     let ingress = channel.ingress();
     let world = channel.world();
     let owner = tokio::spawn(channel.owner().run());
-    let attachment = frida::attach(
+    let running = frida::attach(
         frida::Config::new(config.client().clone()).with_recording(config.recording().clone()),
         ingress.clone(),
     )?;
-    let control = attachment.control();
+    let control = running.client;
+    let _events = running.events;
+    let driver = running.driver;
     let target = Position::new(config.x(), config.y());
     let assets = assets::load_default()?;
     info!(
@@ -66,7 +68,7 @@ async fn run(config: cli::Config) -> Result<(), Error> {
     )
     .await;
 
-    let adapter = attachment.stop().await;
+    let adapter = driver.shutdown().await;
     drop(ingress);
     let owner = owner.await;
     let report = result?;

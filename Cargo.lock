@@ -1476,7 +1476,9 @@ dependencies = [
 name = "viperzoo-adapter-api"
 version = "0.1.0"
 dependencies = [
+ "futures-core",
  "thiserror",
+ "tokio",
  "viperzoo-protocol",
 ]
 
@@ -1485,6 +1487,7 @@ name = "viperzoo-adapter-frida"
 version = "0.1.0"
 dependencies = [
  "frida",
+ "futures-core",
  "hex",
  "serde",
  "serde_json",
@@ -1492,7 +1495,6 @@ dependencies = [
  "tokio",
  "tracing",
  "viperzoo-adapter-api",
- "viperzoo-engine",
  "viperzoo-protocol",
  "windows-sys 0.61.2",
 ]

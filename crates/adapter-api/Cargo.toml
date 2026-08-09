@@ -6,8 +6,12 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-thiserror.workspace = true
-viperzoo-protocol   = { version = "0.1.0", path = "../protocol" }
+futures-core.workspace = true
+thiserror.workspace    = true
+viperzoo-protocol      = { version = "0.1.0", path = "../protocol" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [ "macros", "rt" ] }
 
 [lints]
 workspace = true

@@ -6,6 +6,9 @@
 //! gap. Keeping these cases in the same ordered vocabulary lets the reducer
 //! apply their precedence and reset rules in one place.
 
+use std::future::Future;
+
+use thiserror::Error;
 use viperzoo_protocol::{map, packet::Packet};
 
 use crate::{inventory, resource};
@@ -41,4 +44,31 @@ impl From<Packet> for Observation {
     fn from(packet: Packet) -> Self {
         Self::Packet(packet)
     }
+}
+
+/// A cloneable destination for ordered [`Observation`] values.
+///
+/// Adapters depend on this narrow capability instead of the runtime that owns
+/// the canonical world. Live engines, replay harnesses, and tests can therefore
+/// accept the same typed evidence without becoming adapter dependencies.
+pub trait Sink: Clone + Send + 'static {
+    /// Orders one observation and waits until the receiver has accepted it.
+    fn observe(&self, observation: Observation) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Orders one observation from a synchronous acquisition boundary.
+    ///
+    /// # Panics
+    ///
+    /// Implementations may panic when this method is called from an execution
+    /// context that cannot block. Asynchronous adapters should use
+    /// [`Sink::observe`] instead.
+    fn observe_blocking(&self, observation: Observation) -> Result<(), Error>;
+}
+
+/// Failure to deliver evidence to its canonical observation owner.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum Error {
+    /// The observation owner is no longer accepting evidence.
+    #[error("observation sink is closed")]
+    Closed,
 }

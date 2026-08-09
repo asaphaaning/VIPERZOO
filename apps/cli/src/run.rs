@@ -27,14 +27,16 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let adapter_config = frida::Config::new(config.target().clone())
         .with_agent(config.agent().clone())
         .with_recording(config.recording().clone());
-    let attachment = frida::attach(adapter_config, ingress.clone())?;
+    let running = frida::attach(adapter_config, ingress.clone())?;
+    let mut events = running.events;
+    let driver = running.driver;
     let mut snapshots = world.subscribe();
     let mut ticker = time::interval(EVENT_POLL_INTERVAL);
 
     let stop = loop {
-        drain_events(&attachment);
+        drain_events(&mut events);
 
-        if attachment.is_finished() {
+        if driver.is_finished() {
             break Stop::Detached;
         }
 
@@ -51,10 +53,10 @@ pub async fn run(config: Config) -> Result<(), Error> {
         }
     };
 
-    drain_events(&attachment);
+    drain_events(&mut events);
     let adapter = match stop {
-        Stop::Interrupted => attachment.stop().await,
-        Stop::Detached => attachment.wait().await,
+        Stop::Interrupted => driver.shutdown().await,
+        Stop::Detached => driver.wait().await,
     };
     drop(ingress);
     let owner = owner.await;
@@ -65,8 +67,8 @@ pub async fn run(config: Config) -> Result<(), Error> {
     Ok(())
 }
 
-fn drain_events(attachment: &frida::Attachment) {
-    while let Ok(event) = attachment.events().try_recv() {
+fn drain_events(events: &mut frida::Events) {
+    while let Some(event) = events.next_ready() {
         match event {
             Event::Attached(info) => info!(
                 pid = info.pid(),

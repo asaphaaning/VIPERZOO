@@ -14,7 +14,7 @@ use std::{num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, instrument};
-use viperzoo_adapter_api::observation::Observation;
+use viperzoo_adapter_api::observation::{self, Observation};
 use viperzoo_world::{snapshot::Snapshot, world::Change};
 
 use crate::Reducer;
@@ -167,6 +167,21 @@ impl Ingress {
             .map_err(|_| Error::Stopped)?;
 
         receipt.blocking_recv().map_err(|_| Error::Stopped)
+    }
+}
+
+impl observation::Sink for Ingress {
+    async fn observe(&self, observation: Observation) -> Result<(), observation::Error> {
+        Ingress::observe(self, observation)
+            .await
+            .map(|_| ())
+            .map_err(|Error::Stopped| observation::Error::Closed)
+    }
+
+    fn observe_blocking(&self, observation: Observation) -> Result<(), observation::Error> {
+        Ingress::observe_blocking(self, observation)
+            .map(|_| ())
+            .map_err(|Error::Stopped| observation::Error::Closed)
     }
 }
 

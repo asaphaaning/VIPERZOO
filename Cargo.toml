@@ -27,6 +27,7 @@ frida = { git = "https://github.com/frida/frida-rust", rev = "080e8a99a542150359
 ] }
 axum = { version = "0.8", default-features = false, features = [ "http1", "json", "tokio" ] }
 hex = "0.4.3"
+futures-core = "0.3.31"
 serde = { version = "1.0.228", features = [ "derive" ] }
 serde_json = "1.0.149"
 thiserror = "2.0.17"
