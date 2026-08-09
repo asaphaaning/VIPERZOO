@@ -29,10 +29,11 @@
 //!     .with(console.layer())
 //!     .init();
 //!
-//! console.serve(engine, None, "0.0.0.0:7878".parse().unwrap()).await
+//! console.serve(engine, None, "0.0.0.0:7878".parse().unwrap(), None).await
 //! # }
 //! ```
 
+pub mod control;
 pub mod event;
 pub mod projection;
 pub mod trace;
@@ -46,13 +47,14 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
+    http::StatusCode,
     response::{
-        Html,
+        Html, IntoResponse,
         sse::{Event as SseEvent, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{get, post},
 };
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -126,32 +128,52 @@ impl Console {
     /// fixture collision for the tile inspector; without it that field is
     /// simply absent.
     ///
+    /// `controls` is what keeps this crate from assuming an application exists
+    /// to be driven. Without it the page renders no controls and the signal
+    /// route reports that nothing is listening, so a read-only consumer such as
+    /// a replay viewer is unaffected by the surface existing at all.
+    ///
     /// # Errors
     ///
     /// Returns [`enum@Error`] when the address cannot be bound or the HTTP
     /// server fails.
-    #[instrument(name = "viperzoo::web::serve", skip(self, engine, assets), err)]
+    #[instrument(
+        name = "viperzoo::web::serve",
+        skip(self, engine, assets, controls),
+        err
+    )]
     pub async fn serve(
         &self,
         engine: Handle,
         assets: Option<Catalog>,
         address: SocketAddr,
+        controls: Option<control::Controls>,
     ) -> Result<(), Error> {
         let state = Shared {
             events: self.events.clone(),
             history: Arc::clone(&self.history),
             engine: engine.clone(),
             assets: assets.clone(),
+            controls,
         };
 
         // One publisher serves every console: projecting once per interval and
         // broadcasting keeps a second viewer from doubling the work, and keeps
         // world frames from crowding out tracing on a busy session.
-        tokio::spawn(publish(engine, assets, self.events.clone()));
+        tokio::spawn(publish(
+            engine,
+            assets,
+            self.events.clone(),
+            state.controls.clone(),
+        ));
 
         let router = Router::new()
             .route("/", get(async || Html(PAGE)))
             .route("/events", get(events))
+            // Control is a separate, one-way-in surface. The event stream stays
+            // exactly as it was: `event::Event` still has no command variants,
+            // so what a console reads can never drive anything.
+            .route("/signal", post(signal))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -169,6 +191,32 @@ struct Shared {
     history: Arc<Mutex<VecDeque<event::Trace>>>,
     engine: Handle,
     assets: Option<Catalog>,
+    controls: Option<control::Controls>,
+}
+
+/// Accepts one control request and answers with the state it produced.
+///
+/// The reply carries what the application *is*, not what was asked, so a console
+/// cannot paint itself paused before the application has actually held.
+async fn signal(
+    State(shared): State<Shared>,
+    Json(signal): Json<control::Signal>,
+) -> impl IntoResponse {
+    let Some(controls) = shared.controls else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(control::State::Stopped),
+        );
+    };
+
+    if controls.request(signal).await {
+        (StatusCode::ACCEPTED, Json(controls.state()))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(control::State::Stopped),
+        )
+    }
 }
 
 /// Re-projects the world at a bounded rate for as long as the engine runs.
@@ -176,7 +224,12 @@ struct Shared {
 /// The engine revises state on every decoded packet, several times a second,
 /// each carrying the full tile and entity set. Nobody reads that fast, so
 /// revisions are coalesced into one projection per [`WORLD_INTERVAL`].
-async fn publish(engine: Handle, assets: Option<Catalog>, events: broadcast::Sender<Event>) {
+async fn publish(
+    engine: Handle,
+    assets: Option<Catalog>,
+    events: broadcast::Sender<Event>,
+    controls: Option<control::Controls>,
+) {
     let mut snapshots = engine.subscribe();
 
     loop {
@@ -185,7 +238,13 @@ async fn publish(engine: Handle, assets: Option<Catalog>, events: broadcast::Sen
             return;
         }
 
-        let world = World::project(&snapshots.borrow().clone(), assets.as_ref());
+        // The state travels with the world frame so the console never has to
+        // infer it from its own last request.
+        let world = World::project(
+            &snapshots.borrow().clone(),
+            assets.as_ref(),
+            controls.as_ref().map(control::Controls::state),
+        );
 
         // No subscriber simply means no console is open.
         let _ = events.send(Event::world(world));
@@ -201,7 +260,11 @@ async fn publish(engine: Handle, assets: Option<Catalog>, events: broadcast::Sen
 async fn events(
     State(shared): State<Shared>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let initial = World::project(&shared.engine.snapshot(), shared.assets.as_ref());
+    let initial = World::project(
+        &shared.engine.snapshot(),
+        shared.assets.as_ref(),
+        shared.controls.as_ref().map(control::Controls::state),
+    );
     let replayed = replay(&shared.history);
     let backlog = std::iter::once(Event::world(initial))
         .chain(replayed.into_iter().map(Event::trace))

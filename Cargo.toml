@@ -11,12 +11,7 @@ members = [
   "crates/protocol",
   "crates/web",
   "crates/world",
-  "apps/cli",
-  "apps/live",
-  "apps/replay",
-  "apps/verify",
-  "apps/walk",
-  "apps/woodcut",
+  "apps/*",
 ]
 resolver = "3"
 
@@ -30,7 +25,7 @@ version      = "0.1.0"
 frida = { git = "https://github.com/frida/frida-rust", rev = "080e8a99a542150359c835cd8b572f699f7a2313", features = [
   "auto-download",
 ] }
-axum = { version = "0.8", default-features = false, features = [ "http1", "tokio" ] }
+axum = { version = "0.8", default-features = false, features = [ "http1", "json", "tokio" ] }
 hex = "0.4.3"
 serde = { version = "1.0.228", features = [ "derive" ] }
 serde_json = "1.0.149"

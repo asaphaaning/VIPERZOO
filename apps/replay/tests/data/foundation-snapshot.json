@@ -1,0 +1,103 @@
+{
+  "schema_version": "0.12.0",
+  "revision": 6,
+  "processed_packet_count": 6,
+  "unknown_packet_count": 0,
+  "map": {
+    "state": "identified",
+    "epoch": 1,
+    "context": {
+      "id": 4711,
+      "dimensions": { "width": 17, "height": 17 },
+      "weather": 5,
+      "realm": 0,
+      "title": "Welcome",
+      "light": 232
+    },
+    "tiles": [
+      {
+        "position": { "x": 11, "y": 14 },
+        "ground_id": 59,
+        "pass_value": 0,
+        "object_id": 906
+      },
+      {
+        "position": { "x": 11, "y": 15 },
+        "ground_id": 46,
+        "pass_value": 1,
+        "object_id": 0
+      }
+    ]
+  },
+  "player": {
+    "location": {
+      "state": "seeded",
+      "position": { "x": 3, "y": 1 },
+      "viewport": { "x": 3, "y": 1 },
+      "revision": 3
+    },
+    "facing": { "state": "unknown" },
+    "resources": {
+      "vita": {
+        "current": { "state": "observed", "value": 151, "revision": 2, "source": "player_status" },
+        "maximum": { "state": "observed", "value": 151, "revision": 2, "source": "player_status" }
+      },
+      "mana": {
+        "current": { "state": "observed", "value": 98, "revision": 2, "source": "player_status" },
+        "maximum": { "state": "observed", "value": 98, "revision": 2, "source": "player_status" }
+      }
+    },
+    "level": { "state": "observed", "value": 3, "revision": 2, "source": "player_status" },
+    "inventory_capacity": { "state": "observed", "value": 27, "revision": 2, "source": "player_status" },
+    "economy": {
+      "experience": { "state": "observed", "value": 601, "revision": 2, "source": "player_status" },
+      "money": { "state": "observed", "value": 0, "revision": 2, "source": "player_status" },
+      "experience_percent": { "state": "observed", "value": 0, "revision": 2, "source": "player_status" }
+    }
+  },
+  "entities": [
+    {
+      "id": 35527,
+      "position": { "x": 11, "y": 25 },
+      "direction": "right",
+      "appearance": {
+        "state": "observed",
+        "kind": "actor",
+        "look_id": 32793,
+        "look_color": 5,
+        "unknown": 0,
+        "animations": []
+      },
+      "vitality": null,
+      "revision": 5
+    }
+  ],
+  "connection": "active",
+  "heartbeat": {
+    "challenges_received": 0,
+    "pongs_observed": 0,
+    "matched_pongs": 0,
+    "last_challenge": null,
+    "last_client_tick_low24": null
+  },
+  "recent_actions": [],
+  "recent_combat_actions": [],
+  "spellbook": [],
+  "inventory": [],
+  "inventory_complete": false,
+  "equipment": [],
+  "equipment_complete": false,
+  "actor_actions": [
+    {
+      "actor": 116343,
+      "kind": 16,
+      "reserved": 0,
+      "duration": 120,
+      "trailing_reserved": 0,
+      "opaque_tail": [0, 65, 0, 0]
+    }
+  ],
+  "vitality_events": [],
+  "messages": [],
+  "travel_menu": null
+}

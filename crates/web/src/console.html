@@ -42,7 +42,46 @@
   .badge.up   { color: var(--good); border-color: #2f382d; }
   .badge.down { color: var(--bad);  border-color: #3a2c29; }
 
+  /* Sized and coloured like the badge beside it: this is a status bar, not a
+     toolbar, so the controls should read as part of it rather than as chrome
+     bolted on. */
+  .controls { display: flex; align-items: center; gap: 0; margin-left: auto; }
+  .controls + .badge { margin-left: 12px; }
+  .controls button {
+    font: inherit; font-size: 10px; letter-spacing: .12em; line-height: 1;
+    padding: 5px 11px; cursor: pointer;
+    background: transparent; color: var(--muted-alt);
+    border: 1px solid var(--line);
+    transition: color .12s, border-color .12s, background .12s;
+  }
+  .controls button:first-of-type { border-radius: 2px 0 0 2px; }
+  .controls button:last-of-type { border-radius: 0 2px 2px 0; border-left: none; }
+  .controls button:hover:not(:disabled) {
+    color: var(--amber); border-color: var(--amber-dim); background: var(--raised);
+  }
+  .controls button:active:not(:disabled) { background: #1b201a; }
+  .controls button.go:hover:not(:disabled) { color: var(--good); border-color: #2f382d; }
+  .controls button.halt:hover:not(:disabled) { color: var(--bad); border-color: #3a2c29; }
+  .controls button:disabled { color: #363f38; cursor: default; }
+  /* The state only earns colour when it is not the ordinary case: a console
+     that shouts RUNNING at you trains you to stop reading it. */
+  .controls .state {
+    padding-right: 10px; color: var(--muted); font-size: 10px; letter-spacing: .14em;
+  }
+  .controls .state.pausing,
+  .controls .state.paused  { color: var(--amber); }
+  .controls .state.stopped { color: var(--bad); }
+
+  /* The mount point is a flex item of `body`, and React renders through a
+     `display: contents` wrapper — so this is the link that carries the viewport
+     height down to `main`. Left unstyled it sized to its content instead, every
+     `flex: 1` below resolved against nothing, and the tile map grew to 2346px
+     inside a 720px window and pushed TRACING off the page. */
+  #root { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   main { flex: 1; display: grid; grid-template-columns: 258px 1fr 292px; gap: 1px; background: var(--line-soft); min-height: 0; }
+  /* Grid rows default to `auto`, which means content-sized: without this the
+     single row grows to whatever the tallest column wants. */
+  main { grid-template-rows: minmax(0, 1fr); }
   .col { display: flex; flex-direction: column; gap: 1px; background: var(--line-soft); min-height: 0; overflow: hidden; }
   /* `min-height: 0` lets a panel shrink below its content; `overflow: hidden`
      is what stops it growing past its flex allocation. Without it the tile-map
@@ -130,6 +169,72 @@ const LOG_LIMIT = 400;
 
 const Stat = ({ label, value }) =>
   h("div", { className: "stat" }, h("span", null, label), h("b", null, value ?? "—"));
+
+/// Formats elapsed time since the run started, readably at any run length.
+///
+/// Anchored to the start rather than to now: a scrolling log is read by
+/// comparing lines, and a label that shifts as time passes cannot be compared.
+/// `3847.2s` is technically that, but nobody reads it as "just past the hour",
+/// and runs now last well over one.
+const elapsed = (ms) => {
+  const total = Math.max(0, Math.round(ms / 1000));
+
+  if (total < 60) return `${(ms / 1000).toFixed(1)}s`;
+  if (total < 3600) return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
+
+  return `${Math.floor(total / 3600)}h ${String(Math.floor((total % 3600) / 60)).padStart(2, "0")}m`;
+};
+
+/// Renders play/pause only when an application is listening for signals.
+///
+/// `world.run` is the application's own report, so the label follows what it
+/// actually is rather than what was last clicked. `pausing` is a real state, not
+/// a spinner: the application finishes what it is doing before it holds, and
+/// showing that is what stops a cooperative delay looking like a dead button.
+const Controls = ({ run }) => {
+  // `/signal` answers with the state the request produced, and that answer is
+  // newer than anything the world stream has sent — frames are coalesced to a
+  // quarter second. Showing it at once is what stops a click reading as a no-op
+  // and being pressed again, which is how repeated clicking queued signals for
+  // a state the console had not caught up to. The next frame supersedes it, so
+  // the console still ends up reporting what the application actually is.
+  const [replied, setReplied] = useState(null);
+
+  useEffect(() => setReplied(null), [run]);
+
+  if (!run) return null;
+
+  const send = (signal) =>
+    fetch("/signal", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(signal),
+    })
+      .then((response) => response.json())
+      .then(setReplied)
+      .catch(() => {});
+
+  const shown = replied ?? run;
+  const stopped = shown === "stopped";
+  const held = shown === "paused";
+
+  return h("div", { className: "controls" },
+    h("span", { className: `state ${shown}` }, shown.toUpperCase()),
+    // Left enabled while `pausing`, so a hold that has not landed yet can still
+    // be withdrawn — the application folds pause-then-resume back to running.
+    h("button", {
+      className: held ? "go" : undefined,
+      onClick: () => send(held ? "resume" : "pause"),
+      disabled: stopped,
+      title: held ? "Resume work" : "Hold at the next safe point",
+    }, held ? "▶ RESUME" : "❙❙ PAUSE"),
+    h("button", {
+      className: "halt",
+      onClick: () => send("stop"),
+      disabled: stopped,
+      title: "Finish at the next safe point and stand down",
+    }, "■ STOP"));
+};
 
 const Panel = ({ title, note, grow, style, children }) =>
   h("section", { className: grow ? "grow" : undefined, style },
@@ -300,7 +405,7 @@ function Tracing({ lines }) {
     h("div", { className: "body log", ref: box, onScroll },
       lines.length
         ? lines.map((line, index) => h("div", { key: index, className: `line ${line.level.trim()}` },
-            h("time", null, `${(line.elapsed_ms / 1000).toFixed(1)}s`),
+            h("time", null, elapsed(line.elapsed_ms)),
             h("span", { className: "lvl" }, line.level.trim()),
             h("span", { className: "msg" }, line.message, " ", h("em", null, line.target))))
         : h("div", { className: "empty" }, "no tracing output yet")));
@@ -364,6 +469,7 @@ function Console() {
       h(Stat, { label: "PACKETS", value: `${packets.processed}/${packets.unknown}` }),
       h(Stat, { label: "COVERAGE", value: `${coverage}%` }),
       h(Stat, { label: "HEARTBEAT", value: `${heartbeat.matched}/${heartbeat.challenges}` }),
+      h(Controls, { run: world.run }),
       h("div", { className: `badge ${live && world.connected ? "up" : "down"}` },
         live && world.connected ? "ATTACHED" : "DISCONNECTED")),
 

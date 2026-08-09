@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn captured_foundation_fixture_has_stable_projection() {
-        let fixture = include_str!("../../../fixtures/foundation.jsonl");
+        let fixture = include_str!("../tests/data/foundation.jsonl");
         let report = replay(Cursor::new(fixture), Path::new("foundation.jsonl"))
             .expect("fixture is readable");
         let snapshot = report.snapshot();
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn report_json_is_deterministic() {
-        let fixture = include_str!("../../../fixtures/foundation.jsonl");
+        let fixture = include_str!("../tests/data/foundation.jsonl");
         let first = replay(Cursor::new(fixture), Path::new("foundation.jsonl"))
             .expect("first fixture read succeeds");
         let second = replay(Cursor::new(fixture), Path::new("foundation.jsonl"))
@@ -203,9 +203,9 @@ mod tests {
 
     #[test]
     fn foundation_snapshot_matches_the_checked_in_golden_value() {
-        let fixture = include_str!("../../../fixtures/foundation.jsonl");
+        let fixture = include_str!("../tests/data/foundation.jsonl");
         let expected: serde_json::Value =
-            serde_json::from_str(include_str!("../../../fixtures/foundation-snapshot.json"))
+            serde_json::from_str(include_str!("../tests/data/foundation-snapshot.json"))
                 .expect("golden snapshot is valid JSON");
         let report = replay(Cursor::new(fixture), Path::new("foundation.jsonl"))
             .expect("fixture is readable");

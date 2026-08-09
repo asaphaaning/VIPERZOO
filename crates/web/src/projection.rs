@@ -24,6 +24,14 @@ pub struct World {
     pub revision: u64,
     /// Whether the client session is still active.
     pub connected: bool,
+    /// What the driving application currently is, when one is being driven.
+    ///
+    /// Absent means nothing is listening for controls — a replay viewer, or a
+    /// console started without them — and the page renders no controls at all.
+    /// This is the application's own report, never the console's request, so a
+    /// button cannot show `paused` before the application has actually held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<crate::control::State>,
     /// Decoder progress across every packet this attachment has seen.
     pub packets: Packets,
     /// Session liveness counters.
@@ -197,7 +205,11 @@ impl World {
     /// `assets` supplies [`Tile::collision`]. Passing `None` simply leaves
     /// that field absent rather than substituting a guess.
     #[must_use]
-    pub fn project(snapshot: &Snapshot, assets: Option<&Catalog>) -> Self {
+    pub fn project(
+        snapshot: &Snapshot,
+        assets: Option<&Catalog>,
+        run: Option<crate::control::State>,
+    ) -> Self {
         let map = snapshot.map();
         let context = map.context();
         let player = snapshot.player();
@@ -210,6 +222,7 @@ impl World {
                 snapshot.connection(),
                 viperzoo_world::session::Connection::Active
             ),
+            run,
             packets: Packets::from_snapshot(snapshot),
             heartbeat: Heartbeat {
                 challenges: snapshot.heartbeat().challenges_received(),
@@ -320,7 +333,7 @@ mod tests {
 
     #[test]
     fn empty_attachment_projects_absent_rather_than_zero() {
-        let projected = World::project(&Model::new().snapshot(), None);
+        let projected = World::project(&Model::new().snapshot(), None, None);
 
         assert_eq!(projected.map.origin, "attachment");
         assert_eq!(projected.map.id, None);
@@ -331,7 +344,7 @@ mod tests {
 
     #[test]
     fn coverage_is_zero_before_any_packet() {
-        let projected = World::project(&Model::new().snapshot(), None);
+        let projected = World::project(&Model::new().snapshot(), None, None);
 
         assert_eq!(projected.packets.processed, 0);
         assert_eq!(projected.packets.unknown, 0);

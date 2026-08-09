@@ -1,0 +1,7 @@
+{"timestamp":"2026-07-20T12:58:18.513407+00:00","type":"packet","direction":"incoming","length":24,"hex":"1512670011001105000757656c636f6d6500e80002020200"}
+{"timestamp":"2026-07-20T12:58:18.512999+00:00","type":"packet","direction":"incoming","length":70,"hex":"087900000200030000009700000062040403030400006208a016000000001b000000970000006200000259000000000000000000000001000063bd0000012b62000066276f00"}
+{"timestamp":"2026-07-20T12:58:18.513999+00:00","type":"packet","direction":"incoming","length":13,"hex":"04000300010003000100410000"}
+{"timestamp":"2026-07-20T12:58:19.000000+00:00","type":"packet","direction":"incoming","length":24,"hex":"0600000b000e0102003b0000038a002e000100000b030b00"}
+{"timestamp":"2026-07-20T12:58:19.100000+00:00","type":"packet","direction":"incoming","length":22,"hex":"070001000b00190500008ac780190501000016a5a600"}
+{"timestamp":"2026-07-20T12:58:19.200000+00:00","type":"packet","direction":"incoming","length":13,"hex":"1a0001c6771000780000410000"}
+{"timestamp":"2026-07-20T12:58:19.300000+00:00","type":"network-send","length":4,"hex":"aa000000"}
