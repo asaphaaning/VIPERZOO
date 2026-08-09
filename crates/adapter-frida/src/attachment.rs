@@ -99,7 +99,7 @@ impl runtime::Adapter for Adapter {
 
     async fn start<S>(self, sink: S) -> Result<Running, Self::Error>
     where
-        S: observation::Sink,
+        S: observation::Sink + Clone,
     {
         attach(self.config, sink)
     }
@@ -290,7 +290,7 @@ impl Drop for Driver {
 )]
 pub fn attach<S>(config: Config, ingress: S) -> Result<Running, Error>
 where
-    S: observation::Sink,
+    S: observation::Sink + Clone,
 {
     let (commands, command_receiver) = mpsc::channel();
     let (events, event_receiver) = async_mpsc::unbounded_channel();
@@ -328,7 +328,7 @@ fn run<S>(
     events: async_mpsc::UnboundedSender<Event>,
 ) -> Result<(), Error>
 where
-    S: observation::Sink,
+    S: observation::Sink + Clone,
 {
     // SAFETY: This dedicated thread is the sole owner of the Frida runtime,
     // and every borrowed manager, device, session, and script is dropped

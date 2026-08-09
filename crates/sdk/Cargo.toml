@@ -18,8 +18,9 @@ viperzoo-protocol    = { version = "0.1.0", path = "../protocol" }
 viperzoo-world       = { version = "0.1.0", path = "../world" }
 
 [dev-dependencies]
-futures-core.workspace = true
 tokio = { workspace = true, features = [ "macros", "rt" ] }
+tokio-stream.workspace = true
+viperzoo-adapter-api = { version = "0.1.0", path = "../adapter-api", features = [ "test-util" ] }
 
 [lints]
 workspace = true

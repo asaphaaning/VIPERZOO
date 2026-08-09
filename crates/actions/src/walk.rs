@@ -592,116 +592,119 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        convert::Infallible,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
 
+    use viperzoo_adapter_api::action::MockClient;
     use viperzoo_engine::{Config as EngineConfig, Ingress};
-    use viperzoo_protocol::{decode, direction::Flow};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+    };
 
     use super::*;
 
-    #[derive(Clone)]
-    struct TransitioningClient {
-        ingress: Ingress,
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
     }
 
-    #[derive(Clone, Default)]
-    struct CountingClient {
+    fn transitioning_client(ingress: Ingress) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+
+            Box::pin(async move {
+                if matches!(action, action::Action::Step(_)) {
+                    for body in [
+                        "1512680011001105000757656c636f6d6500e80002020200",
+                        "04000500050003000100410000",
+                    ] {
+                        let bytes = hex::decode(body).expect("fixture hex is valid");
+                        let packet =
+                            decode(Flow::Clientbound, &bytes).expect("fixture packet decodes");
+                        ingress
+                            .observe(packet.into())
+                            .await
+                            .expect("test engine remains available");
+                    }
+                }
+
+                Ok(())
+            })
+        });
+        client
+    }
+
+    fn counting_client(
         map_data_requests: Arc<AtomicUsize>,
         refresh_requests: Arc<AtomicUsize>,
-    }
-
-    #[derive(Clone)]
-    struct ObstructingClient {
-        ingress: Ingress,
-        world: World,
-        directions: Arc<Mutex<Vec<Direction>>>,
-    }
-
-    impl Client for CountingClient {
-        type Error = Infallible;
-
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
+    ) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
             match action {
                 action::Action::MapData(_) => {
-                    self.map_data_requests.fetch_add(1, Ordering::Relaxed);
+                    map_data_requests.fetch_add(1, Ordering::Relaxed);
                 }
                 action::Action::RefreshMap => {
-                    self.refresh_requests.fetch_add(1, Ordering::Relaxed);
+                    refresh_requests.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => {}
             }
 
-            Ok(())
-        }
+            Box::pin(std::future::ready(Ok(())))
+        });
+        client
     }
 
-    impl Client for TransitioningClient {
-        type Error = Infallible;
+    fn obstructing_client(
+        ingress: Ingress,
+        world: World,
+        directions: Arc<Mutex<Vec<Direction>>>,
+    ) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+            let world = world.clone();
+            let directions = Arc::clone(&directions);
 
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            if !matches!(action, action::Action::Step(_)) {
-                return Ok(());
-            }
+            Box::pin(async move {
+                let action::Action::Step(direction) = action else {
+                    return Ok(());
+                };
+                directions
+                    .lock()
+                    .expect("test direction log remains available")
+                    .push(direction);
 
-            for body in [
-                "1512680011001105000757656c636f6d6500e80002020200",
-                "04000500050003000100410000",
-            ] {
-                let bytes = hex::decode(body).expect("fixture hex is valid");
-                let packet = decode(Flow::Clientbound, &bytes).expect("fixture packet decodes");
-                self.ingress
+                let position = world
+                    .latest()
+                    .player()
+                    .location()
+                    .position()
+                    .expect("test fixture is localized");
+                let body = format!(
+                    "69{:04x}{:04x}{:02x}00",
+                    position.x().value(),
+                    position.y().value(),
+                    direction.to_wire(),
+                );
+                let packet = decode(
+                    Flow::Serverbound,
+                    &hex::decode(body).expect("constructed obstruction body is valid hex"),
+                )
+                .expect("constructed obstruction body is structurally valid");
+                ingress
                     .observe(packet.into())
                     .await
                     .expect("test engine remains available");
-            }
 
-            Ok(())
-        }
-    }
-
-    impl Client for ObstructingClient {
-        type Error = Infallible;
-
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            let action::Action::Step(direction) = action else {
-                return Ok(());
-            };
-            self.directions
-                .lock()
-                .expect("test direction log remains available")
-                .push(direction);
-
-            let position = self
-                .world
-                .latest()
-                .player()
-                .location()
-                .position()
-                .expect("test fixture is localized");
-            let body = format!(
-                "69{:04x}{:04x}{:02x}00",
-                position.x().value(),
-                position.y().value(),
-                direction.to_wire(),
-            );
-            let packet = decode(
-                Flow::Serverbound,
-                &hex::decode(body).expect("constructed obstruction body is valid hex"),
-            )
-            .expect("constructed obstruction body is structurally valid");
-            self.ingress
-                .observe(packet.into())
-                .await
-                .expect("test engine remains available");
-
-            Ok(())
-        }
+                Ok(())
+            })
+        });
+        client
     }
 
     #[tokio::test]
@@ -723,9 +726,7 @@ mod tests {
                 .expect("test engine remains available");
         }
 
-        let client = TransitioningClient {
-            ingress: ingress.clone(),
-        };
+        let client = transitioning_client(ingress.clone());
         let result = to(&client, &world, Position::new(3, 0), Config::default()).await;
 
         assert!(matches!(
@@ -757,15 +758,20 @@ mod tests {
                 .expect("test engine remains available");
         }
 
-        let client = CountingClient::default();
+        let map_data_requests = Arc::new(AtomicUsize::new(0));
+        let refresh_requests = Arc::new(AtomicUsize::new(0));
+        let client = counting_client(
+            Arc::clone(&map_data_requests),
+            Arc::clone(&refresh_requests),
+        );
         let mut snapshots = world.subscribe();
         let attempts = bootstrap(&client, &mut snapshots, Config::default())
             .await
             .expect("localized projection needs no bootstrap action");
 
         assert_eq!(attempts, 0);
-        assert_eq!(client.map_data_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(client.refresh_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(map_data_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(refresh_requests.load(Ordering::Relaxed), 0);
 
         drop(ingress);
         owner.await.expect("engine owner joins");
@@ -789,11 +795,7 @@ mod tests {
             .expect("test engine remains available");
 
         let directions = Arc::new(Mutex::new(Vec::new()));
-        let client = ObstructingClient {
-            ingress: ingress.clone(),
-            world: world.clone(),
-            directions: directions.clone(),
-        };
+        let client = obstructing_client(ingress.clone(), world.clone(), Arc::clone(&directions));
         let config = Config::new(
             Duration::from_millis(20),
             Duration::from_millis(20),

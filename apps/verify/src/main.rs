@@ -4,19 +4,21 @@ mod cli;
 mod reference;
 mod verification;
 
-use std::{fs::File, io::BufReader, path::PathBuf, process::ExitCode};
+use std::{path::PathBuf, process::ExitCode};
 
 use thiserror::Error;
+use tokio::{fs::File, io::BufReader};
 use tracing::instrument;
 use viperzoo_replay::capture;
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
 
-    match run() {
+    match run().await {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(2),
         Err(error) => {
@@ -27,13 +29,15 @@ fn main() -> ExitCode {
 }
 
 #[instrument(name = "viperzoo::app::verify::run", err, ret(level = "debug"))]
-fn run() -> Result<bool, Error> {
+async fn run() -> Result<bool, Error> {
     let config = cli::Config::parse(std::env::args_os().skip(1))?;
-    let capture_file = File::open(config.capture()).map_err(|source| Error::Open {
-        path: config.capture().to_owned(),
-        source,
-    })?;
-    let replay = capture::replay(BufReader::new(capture_file), config.capture())?;
+    let capture_file = File::open(config.capture())
+        .await
+        .map_err(|source| Error::Open {
+            path: config.capture().to_owned(),
+            source,
+        })?;
+    let replay = capture::replay(BufReader::new(capture_file), config.capture()).await?;
     let reference = reference::State::read(config.reference())?;
     let report = verification::Report::compare(&replay, &reference);
 

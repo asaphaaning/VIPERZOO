@@ -24,7 +24,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(config).await {
+    match Box::pin(run(config)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "destination walk failed");

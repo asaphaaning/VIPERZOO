@@ -486,6 +486,10 @@ pub enum MapData {
 }
 
 /// Asynchronous client action boundary implemented by acquisition adapters.
+#[cfg_attr(
+    any(test, feature = "test-util"),
+    mockall::automock(type Error = std::convert::Infallible;)
+)]
 pub trait Client: Send + Sync {
     /// Adapter-specific submission failure.
     type Error;

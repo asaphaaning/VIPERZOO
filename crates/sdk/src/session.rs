@@ -202,84 +202,57 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        convert::Infallible,
-        pin::Pin,
-        task::{Context, Poll},
-    };
+    use std::convert::Infallible;
 
-    use futures_core::Stream;
-    use viperzoo_adapter_api::{action, observation};
+    use viperzoo_adapter_api::{action::MockClient, observation, runtime::MockDriver};
     use viperzoo_world::revision::Revision;
 
     use super::*;
 
-    #[derive(Clone, Debug)]
-    struct Client;
-
-    impl action::Client for Client {
-        type Error = Infallible;
-
-        async fn perform(&self, _action: action::Action) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
     #[derive(Debug)]
-    struct Events;
-
-    impl Stream for Events {
-        type Item = Infallible;
-
-        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(None)
-        }
+    struct Fake {
+        client: MockClient,
+        driver: MockDriver,
     }
-
-    #[derive(Debug)]
-    struct Driver;
-
-    impl viperzoo_adapter_api::runtime::Driver for Driver {
-        type Error = Infallible;
-
-        fn is_finished(&self) -> bool {
-            false
-        }
-
-        async fn wait(self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        async fn shutdown(self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
-    #[derive(Debug)]
-    struct Fake;
 
     impl Adapter for Fake {
-        type Client = Client;
-        type Driver = Driver;
+        type Client = MockClient;
+        type Driver = MockDriver;
         type Error = Infallible;
         type Event = Infallible;
-        type Events = Events;
+        type Events = tokio_stream::Empty<Infallible>;
 
-        async fn start<S>(self, sink: S) -> Result<Running<Client, Events, Driver>, Self::Error>
+        async fn start<S>(
+            self,
+            sink: S,
+        ) -> Result<viperzoo_adapter_api::runtime::Started<Self>, Self::Error>
         where
-            S: observation::Sink,
+            S: observation::Sink + Clone,
         {
             sink.observe(observation::Observation::SessionStarted)
                 .await
                 .expect("engine accepts the session boundary");
 
-            Ok(Running::new(Client, Events, Driver))
+            Ok(Running::new(
+                self.client,
+                tokio_stream::empty(),
+                self.driver,
+            ))
         }
     }
 
     #[tokio::test]
     async fn session_owns_adapter_and_engine_as_one_lifecycle() {
-        let session = Session::builder(Fake)
+        let mut driver = MockDriver::new();
+        driver
+            .expect_shutdown()
+            .times(1)
+            .returning(|| Box::pin(std::future::ready(Ok(()))));
+        let adapter = Fake {
+            client: MockClient::new(),
+            driver,
+        };
+        let session = Session::builder(adapter)
             .start()
             .await
             .expect("fake session starts");

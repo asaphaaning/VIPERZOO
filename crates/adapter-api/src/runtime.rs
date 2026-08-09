@@ -58,7 +58,7 @@ pub trait Adapter: Sized {
     /// Starts acquisition against the given observation sink.
     fn start<S>(self, sink: S) -> impl Future<Output = Result<Started<Self>, Self::Error>> + Send
     where
-        S: observation::Sink;
+        S: observation::Sink + Clone;
 }
 
 /// The capabilities produced by a particular [`Adapter`] implementation.
@@ -66,6 +66,10 @@ pub type Started<A> =
     Running<<A as Adapter>::Client, <A as Adapter>::Events, <A as Adapter>::Driver>;
 
 /// Single-owner lifecycle capability of a running [`Adapter`].
+#[cfg_attr(
+    any(test, feature = "test-util"),
+    mockall::automock(type Error = std::convert::Infallible;)
+)]
 pub trait Driver: Sized + Send + 'static {
     /// Fatal acquisition or teardown failure.
     type Error;
@@ -84,104 +88,74 @@ pub trait Driver: Sized + Send + 'static {
 mod tests {
     use std::{
         convert::Infallible,
-        pin::Pin,
         sync::{Arc, Mutex},
-        task::{Context, Poll},
     };
 
     use super::*;
-    use crate::observation::Observation;
-
-    #[derive(Clone, Debug, Default)]
-    struct Sink {
-        observations: Arc<Mutex<Vec<Observation>>>,
-    }
-
-    impl observation::Sink for Sink {
-        async fn observe(&self, observation: Observation) -> Result<(), observation::Error> {
-            self.observe_blocking(observation)
-        }
-
-        fn observe_blocking(&self, observation: Observation) -> Result<(), observation::Error> {
-            self.observations
-                .lock()
-                .expect("test observation lock is not poisoned")
-                .push(observation);
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct Client;
-
-    impl action::Client for Client {
-        type Error = Infallible;
-
-        async fn perform(&self, _action: action::Action) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
+    use crate::{
+        action::MockClient,
+        observation::{MockSink, Observation},
+    };
 
     #[derive(Debug)]
-    struct Events;
-
-    impl Stream for Events {
-        type Item = Infallible;
-
-        fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(None)
-        }
+    struct Fake {
+        client: MockClient,
+        driver: MockDriver,
     }
-
-    #[derive(Debug)]
-    struct Owner;
-
-    impl Driver for Owner {
-        type Error = Infallible;
-
-        fn is_finished(&self) -> bool {
-            false
-        }
-
-        async fn wait(self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        async fn shutdown(self) -> Result<(), Self::Error> {
-            Ok(())
-        }
-    }
-
-    #[derive(Debug)]
-    struct Fake;
 
     impl Adapter for Fake {
-        type Client = Client;
-        type Driver = Owner;
+        type Client = MockClient;
+        type Driver = MockDriver;
         type Error = Infallible;
         type Event = Infallible;
-        type Events = Events;
+        type Events = tokio_stream::Empty<Infallible>;
 
         async fn start<S>(
             self,
             sink: S,
         ) -> Result<Running<Self::Client, Self::Events, Self::Driver>, Self::Error>
         where
-            S: observation::Sink,
+            S: observation::Sink + Clone,
         {
             sink.observe(Observation::SessionStarted)
                 .await
                 .expect("fake sink accepts a session boundary");
 
-            Ok(Running::new(Client, Events, Owner))
+            Ok(Running::new(
+                self.client,
+                tokio_stream::empty(),
+                self.driver,
+            ))
         }
     }
 
     #[tokio::test]
     async fn fake_adapter_proves_the_contract_without_an_engine() {
-        let sink = Sink::default();
-        let observations = Arc::clone(&sink.observations);
-        let running = Fake.start(sink).await.expect("fake adapter starts");
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observations);
+        let mut sink = MockSink::new();
+        sink.expect_observe()
+            .times(1)
+            .returning(move |observation| {
+                observed
+                    .lock()
+                    .expect("test observation lock is not poisoned")
+                    .push(observation);
+                Box::pin(std::future::ready(Ok(())))
+            });
+        let mut driver = MockDriver::new();
+        driver
+            .expect_shutdown()
+            .times(1)
+            .returning(|| Box::pin(std::future::ready(Ok(()))));
+        let adapter = Fake {
+            client: MockClient::new(),
+            driver,
+        };
+        let running = adapter
+            .start(Arc::new(sink))
+            .await
+            .expect("fake adapter starts");
 
         running.driver.shutdown().await.expect("fake owner stops");
 

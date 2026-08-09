@@ -5,13 +5,19 @@ name                   = "viperzoo-adapter-api"
 rust-version.workspace = true
 version.workspace      = true
 
+[features]
+test-util = [ "dep:mockall" ]
+
 [dependencies]
 futures-core.workspace = true
+mockall                = { workspace = true, optional = true }
 thiserror.workspace    = true
 viperzoo-protocol      = { version = "0.1.0", path = "../protocol" }
 
 [dev-dependencies]
+mockall.workspace = true
 tokio = { workspace = true, features = [ "macros", "rt" ] }
+tokio-stream.workspace = true
 
 [lints]
 workspace = true

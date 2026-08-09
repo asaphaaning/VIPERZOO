@@ -19,6 +19,7 @@ viperzoo-world       = { version = "0.1.0", path = "../world" }
 [dev-dependencies]
 hex.workspace = true
 tokio         = { workspace = true, features = [ "macros", "rt" ] }
+viperzoo-adapter-api = { version = "0.1.0", path = "../adapter-api", features = [ "test-util" ] }
 
 [lints]
 workspace = true

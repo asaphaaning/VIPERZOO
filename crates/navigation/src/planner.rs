@@ -467,10 +467,18 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
     use viperzoo_assets::{Catalog, Collision, Fixture, Metadata};
-    use viperzoo_protocol::{decode, direction::Flow};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+    };
     use viperzoo_world::world::World;
 
     use super::*;
+
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
+    }
 
     fn apply(world: &mut World, value: &str) {
         let bytes = hex::decode(value).expect("valid fixture hex");

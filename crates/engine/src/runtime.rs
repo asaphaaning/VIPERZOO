@@ -450,10 +450,19 @@ pub enum WaitError {
 
 #[cfg(test)]
 mod tests {
-    use viperzoo_protocol::{decode, direction::Flow, primitive::Position};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+        primitive::Position,
+    };
     use viperzoo_world::{query, revision::Revision};
 
     use super::*;
+
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
+    }
 
     #[tokio::test]
     async fn observations_are_acknowledged_after_snapshot_publication() {

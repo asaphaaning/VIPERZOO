@@ -67,10 +67,18 @@ const fn observation_name(observation: &Observation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use viperzoo_adapter_api::resource::{Pool, Resources, Source};
-    use viperzoo_protocol::{decode, direction::Flow};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+    };
     use viperzoo_world::knowledge::Source as WorldSource;
 
     use super::*;
+
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
+    }
 
     #[test]
     fn session_boundary_resets_session_scoped_state() {

@@ -12,7 +12,9 @@
 //! ```text
 //! Script ── Action ──► Control ──► dedicated Frida thread ──► client
 //!                                      │
-//! client callback ── plaintext body ──┴──► Observation ──► engine
+//! client callback ── bounded body ─────┴──► protocol Codec ──► Observation
+//!                                      │
+//!                                      └──► capture Codec ──► JSONL evidence
 //! ```
 
 mod agent;

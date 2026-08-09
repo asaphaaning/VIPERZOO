@@ -238,88 +238,90 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        convert::Infallible,
-        sync::{
-            Arc,
-            atomic::{AtomicU8, Ordering},
-        },
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
     };
 
+    use viperzoo_adapter_api::action::MockClient;
     use viperzoo_engine::{Config as EngineConfig, Ingress};
-    use viperzoo_protocol::{decode, direction::Flow};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+    };
 
     use super::*;
 
-    #[derive(Clone)]
-    struct ObservingClient {
-        ingress: Ingress,
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
     }
 
-    #[derive(Clone)]
-    struct AttackOnlyClient {
-        ingress: Ingress,
+    fn observing_client(ingress: Ingress) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+
+            Box::pin(async move {
+                let body = match action {
+                    action::Action::Face(direction) => vec![0x11, direction.to_wire(), 0x00],
+                    action::Action::Attack(_) => vec![0x13, 0x00, 0x00],
+                    _ => return Ok(()),
+                };
+                let packet = decode(Flow::Serverbound, &body).expect("fixture action decodes");
+                ingress
+                    .observe(packet.into())
+                    .await
+                    .expect("test engine remains available");
+
+                Ok(())
+            })
+        });
+        client
     }
 
-    #[derive(Clone)]
-    struct DirectionalAttackClient {
-        ingress: Ingress,
-        submissions: Arc<AtomicU8>,
+    fn attack_only_client(ingress: Ingress) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+
+            Box::pin(async move {
+                if matches!(action, action::Action::Attack(_)) {
+                    let packet = decode(Flow::Serverbound, &[0x13, 0x00, 0x00])
+                        .expect("fixture action decodes");
+                    ingress
+                        .observe(packet.into())
+                        .await
+                        .expect("test engine remains available");
+                }
+
+                Ok(())
+            })
+        });
+        client
     }
 
-    impl Client for ObservingClient {
-        type Error = Infallible;
+    fn directional_attack_client(ingress: Ingress, submissions: Arc<AtomicU8>) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+            let submissions = Arc::clone(&submissions);
 
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            let body = match action {
-                action::Action::Face(direction) => vec![0x11, direction.to_wire(), 0x00],
-                action::Action::Attack(_) => vec![0x13, 0x00, 0x00],
-                _ => return Ok(()),
-            };
-            let packet = decode(Flow::Serverbound, &body).expect("fixture action decodes");
-            self.ingress
-                .observe(packet.into())
-                .await
-                .expect("test engine remains available");
-            Ok(())
-        }
-    }
+            Box::pin(async move {
+                if matches!(action, action::Action::Face(_) | action::Action::Attack(_)) {
+                    let packet = decode(Flow::Serverbound, &[0x13, 0x00, 0x00])
+                        .expect("fixture action decodes");
+                    ingress
+                        .observe(packet.into())
+                        .await
+                        .expect("test engine remains available");
+                    submissions.fetch_add(1, Ordering::Relaxed);
+                }
 
-    impl Client for AttackOnlyClient {
-        type Error = Infallible;
-
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            if !matches!(action, action::Action::Attack(_)) {
-                return Ok(());
-            }
-
-            let packet =
-                decode(Flow::Serverbound, &[0x13, 0x00, 0x00]).expect("fixture action decodes");
-            self.ingress
-                .observe(packet.into())
-                .await
-                .expect("test engine remains available");
-            Ok(())
-        }
-    }
-
-    impl Client for DirectionalAttackClient {
-        type Error = Infallible;
-
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            if !matches!(action, action::Action::Face(_) | action::Action::Attack(_)) {
-                return Ok(());
-            }
-
-            let packet =
-                decode(Flow::Serverbound, &[0x13, 0x00, 0x00]).expect("fixture action decodes");
-            self.ingress
-                .observe(packet.into())
-                .await
-                .expect("test engine remains available");
-            self.submissions.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
+                Ok(())
+            })
+        });
+        client
     }
 
     #[tokio::test]
@@ -328,9 +330,7 @@ mod tests {
         let ingress = channel.ingress();
         let world = channel.world();
         let owner = tokio::spawn(channel.owner().run());
-        let client = ObservingClient {
-            ingress: ingress.clone(),
-        };
+        let client = observing_client(ingress.clone());
 
         let report = face_and_attack(&client, &world, Direction::Right, Config::default())
             .await
@@ -356,9 +356,7 @@ mod tests {
         let ingress = channel.ingress();
         let world = channel.world();
         let owner = tokio::spawn(channel.owner().run());
-        let client = ObservingClient {
-            ingress: ingress.clone(),
-        };
+        let client = observing_client(ingress.clone());
 
         face_and_attack(&client, &world, Direction::Right, Config::default())
             .await
@@ -382,9 +380,7 @@ mod tests {
         let ingress = channel.ingress();
         let world = channel.world();
         let owner = tokio::spawn(channel.owner().run());
-        let client = AttackOnlyClient {
-            ingress: ingress.clone(),
-        };
+        let client = attack_only_client(ingress.clone());
 
         let report = face_and_attack(&client, &world, Direction::Up, Config::new(Duration::ZERO))
             .await
@@ -403,10 +399,8 @@ mod tests {
         let ingress = channel.ingress();
         let world = channel.world();
         let owner = tokio::spawn(channel.owner().run());
-        let client = DirectionalAttackClient {
-            ingress: ingress.clone(),
-            submissions: Arc::new(AtomicU8::new(0)),
-        };
+        let submissions = Arc::new(AtomicU8::new(0));
+        let client = directional_attack_client(ingress.clone(), Arc::clone(&submissions));
 
         let report = face_and_attack(&client, &world, Direction::Up, Config::new(Duration::ZERO))
             .await
@@ -414,7 +408,7 @@ mod tests {
 
         assert_eq!(report.facing(), Facing::Submitted);
         assert_eq!(report.attack().value(), 1);
-        assert_eq!(client.submissions.load(Ordering::Relaxed), 1);
+        assert_eq!(submissions.load(Ordering::Relaxed), 1);
 
         drop(client);
         drop(ingress);

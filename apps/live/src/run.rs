@@ -2,17 +2,20 @@
 
 use std::{io::SeekFrom, path::PathBuf, time::Duration};
 
+use bytes::BytesMut;
 use thiserror::Error;
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, AsyncSeekExt, BufReader, BufWriter},
+    io::{AsyncReadExt, AsyncSeekExt, BufWriter},
     time,
 };
+use tokio_util::codec::Decoder;
 use tracing::{debug, instrument};
 use viperzoo_adapter_api::observation::Observation;
 use viperzoo_capture::{
+    codec::{self, Codec},
     line::Line,
-    record::{self, Record},
+    record::Record,
 };
 use viperzoo_engine::{self, Ingress, World};
 use viperzoo_world::world::Change;
@@ -39,7 +42,7 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
             path: config.capture().to_owned(),
             source,
         })?;
-    let mut reader = BufReader::new(file);
+    let mut reader = file;
 
     if config.start() == Start::End {
         reader
@@ -57,16 +60,16 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
     let world = channel.world();
     let _owner = tokio::spawn(channel.owner().run());
     let mut phase = Phase::CatchingUp;
-    let mut pending = String::new();
-    let mut line = Line::FIRST;
+    let mut pending = BytesMut::new();
+    let mut codec = Codec::new();
 
     loop {
         let bytes_read = reader
-            .read_line(&mut pending)
+            .read_buf(&mut pending)
             .await
             .map_err(|source| Error::Read {
                 path: config.capture().to_owned(),
-                line,
+                line: codec.next_line(),
                 source,
             })?;
 
@@ -85,23 +88,17 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
             continue;
         }
 
-        if !pending.ends_with('\n') {
-            continue;
+        while let Some(record) = codec.decode(&mut pending)? {
+            publish_record(
+                &mut output,
+                config.output(),
+                &ingress,
+                &world,
+                phase,
+                record,
+            )
+            .await?;
         }
-
-        let input = pending.trim_end_matches(['\r', '\n']);
-        publish_record(
-            &mut output,
-            config.output(),
-            &ingress,
-            &world,
-            phase,
-            record::decode(line, input),
-        )
-        .await?;
-
-        pending.clear();
-        line = line.next().ok_or(Error::LineCapacity)?;
     }
 }
 
@@ -232,13 +229,13 @@ pub enum Error {
         /// Capture path.
         path: PathBuf,
         /// One-based line since the selected attachment position.
-        line: Line,
+        line: Option<Line>,
         /// Filesystem failure.
         source: std::io::Error,
     },
-    /// The stream exceeded the complete `u64` line identity space.
-    #[error("live capture exceeds the supported line identity space")]
-    LineCapacity,
+    /// Capture row framing failed.
+    #[error(transparent)]
+    Capture(#[from] codec::Error),
     /// A typed engine event could not be published.
     #[error(transparent)]
     Message(#[from] message::Error),

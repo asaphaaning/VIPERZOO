@@ -303,8 +303,9 @@ mod tests {
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("..")
-            .join("fixtures")
+            .join("replay")
+            .join("tests")
+            .join("data")
             .join(name)
     }
 
@@ -338,11 +339,13 @@ mod tests {
         .expect("reference fixture has the production schema")
     }
 
-    #[test]
-    fn passes_only_when_every_claimed_field_matches() {
+    #[tokio::test]
+    async fn passes_only_when_every_claimed_field_matches() {
         let path = fixture("foundation.jsonl");
         let input = fs::read(&path).expect("fixture is readable");
-        let replay = capture::replay(input.as_slice(), &path).expect("fixture replays");
+        let replay = capture::replay(input.as_slice(), &path)
+            .await
+            .expect("fixture replays");
 
         assert!(Report::compare(&replay, &foundation_reference(2)).passed());
         assert!(!Report::compare(&replay, &foundation_reference(3)).passed());

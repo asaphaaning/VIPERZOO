@@ -24,7 +24,7 @@ use tracing::instrument;
 use crate::direction::Flow;
 use crate::{client, packet, server};
 
-/// Decodes one already-delimited plaintext logical body.
+/// Decodes one complete, already-delimited plaintext logical body.
 ///
 /// Unknown opcodes produce [`packet::Unknown`] with the exact original bytes.
 /// Malformed layouts of known opcodes return [`enum@Error`] and must not mutate
@@ -41,7 +41,7 @@ use crate::{client, packet, server};
     err,
     ret(level = "trace")
 )]
-pub fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, Error> {
+pub(crate) fn body(flow: Flow, body: &[u8]) -> Result<packet::Packet, Error> {
     let Some(&opcode) = body.first() else {
         return Err(Error::Empty);
     };
@@ -329,6 +329,10 @@ mod tests {
     use crate::primitive::Position;
 
     use super::*;
+
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, Error> {
+        super::body(flow, body)
+    }
 
     fn body(value: &str) -> Vec<u8> {
         hex::decode(value).expect("test fixture contains valid hex")
