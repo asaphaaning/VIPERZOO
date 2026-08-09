@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use thiserror::Error;
 use tracing::{info, instrument};
 use viperzoo_adapter_frida as frida;
-use viperzoo_sdk::{Session, actions, assets, protocol::primitive::Position};
+use viperzoo_sdk::{actions, assets, protocol::primitive::Position, session};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -44,9 +44,8 @@ async fn run(config: cli::Config) -> Result<(), Error> {
     let adapter = frida::Adapter::new(
         frida::Config::new(config.client().clone()).with_recording(config.recording().clone()),
     );
-    let session = Session::builder(adapter).start().await?;
+    let session = session().adapter(adapter).discard_events().start().await?;
     let control = session.client;
-    let _events = session.events;
     let world = session.world;
     let owner = session.owner;
     let target = Position::new(config.x(), config.y());

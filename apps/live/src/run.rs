@@ -56,9 +56,10 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
 
     let mut output = BufWriter::new(tokio::io::stdout());
     let channel = viperzoo_engine::channel(viperzoo_engine::Config::default());
-    let ingress = channel.ingress();
-    let world = channel.world();
-    let _owner = tokio::spawn(channel.owner().run());
+    let engine = channel.spawn()?;
+    let ingress = engine.ingress();
+    let world = engine.world();
+    let _engine = engine.owner();
     let mut phase = Phase::CatchingUp;
     let mut pending = BytesMut::new();
     let mut codec = Codec::new();
@@ -207,6 +208,9 @@ async fn publish_ready(
 /// Fatal live acquisition failure.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// The canonical engine could not be scheduled.
+    #[error(transparent)]
+    EngineStart(#[from] viperzoo_engine::SpawnError),
     /// The capture file could not be opened.
     #[error("unable to open live capture {path}: {source}")]
     Open {
