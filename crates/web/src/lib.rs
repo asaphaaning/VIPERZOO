@@ -49,7 +49,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, header::CONTENT_TYPE},
     response::{
         Html, IntoResponse,
         sse::{Event as SseEvent, KeepAlive, Sse},
@@ -67,6 +67,9 @@ use crate::{event::Event, projection::World};
 
 /// Console page, embedded so a running engine needs no asset directory.
 const PAGE: &str = include_str!("console.html");
+
+/// Console logo, embedded alongside [`PAGE`] for the same deployment shape.
+const LOGO: &[u8] = include_bytes!("../assets/viperzoo-logo.png");
 
 /// How many events a slow console may fall behind before it is dropped.
 const BACKLOG: usize = 512;
@@ -169,6 +172,7 @@ impl Console {
 
         let router = Router::new()
             .route("/", get(async || Html(PAGE)))
+            .route("/assets/viperzoo-logo.png", get(logo))
             .route("/events", get(events))
             // Control is a separate, one-way-in surface. The event stream stays
             // exactly as it was: `event::Event` still has no command variants,
@@ -182,6 +186,11 @@ impl Console {
         info!(%address, "console available");
         axum::serve(listener, router).await.map_err(Error::Serve)
     }
+}
+
+/// Serves the embedded console mark without requiring a static asset folder.
+async fn logo() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "image/png")], LOGO)
 }
 
 /// Shared handles every console request needs.
