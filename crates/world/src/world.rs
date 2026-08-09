@@ -455,9 +455,18 @@ mod tests {
     use viperzoo_adapter_api::inventory::{
         Item as ClientInventoryItem, Snapshot as ClientInventorySnapshot, Source as InventorySource,
     };
-    use viperzoo_protocol::{decode, direction::Flow, primitive::Position};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+        primitive::Position,
+    };
 
     use super::*;
+
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
+    }
 
     fn apply_hex(world: &mut World, value: &str) {
         let bytes = hex::decode(value).expect("test fixture contains valid hex");

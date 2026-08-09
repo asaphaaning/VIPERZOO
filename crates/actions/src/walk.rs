@@ -16,17 +16,17 @@
 use std::{fmt, time::Duration};
 
 use thiserror::Error;
-use tokio::{sync::watch, time};
+use tokio::time;
 use tracing::{debug, instrument};
 use viperzoo_adapter_api::action::{self, Client};
 use viperzoo_assets::Catalog;
-use viperzoo_engine::Handle;
+use viperzoo_engine::{Subscription, WaitError as WorldWaitError, World};
 use viperzoo_navigation::{Avoidance, Knowledge, Plan, plan_avoiding, plan_with_assets_avoiding};
 
 /// The directed step reported by [`Error::MapChanged`].
 pub use viperzoo_navigation::Edge;
 use viperzoo_protocol::{direction::Direction, primitive::Position};
-use viperzoo_world::{map::Origin, snapshot::Snapshot};
+use viperzoo_world::{map::Origin, query, snapshot::Snapshot};
 
 const EDGE_OBSERVATIONS: u8 = 3;
 const REVALIDATION_EPOCHS: u8 = 3;
@@ -112,17 +112,17 @@ impl Report {
 /// # Errors
 ///
 /// Returns [`enum@Error`] for adapter failures, unavailable state, planning
-/// failures, engine shutdown, or exhausted safety limits.
+/// failures, world shutdown, or exhausted safety limits.
 #[instrument(
     name = "viperzoo::actions::walk_to",
-    skip(client, engine),
+    skip(client, world),
     fields(target_x = target.x().value(), target_y = target.y().value()),
     err(level = "debug"),
     ret(level = "debug")
 )]
 pub async fn to<C>(
     client: &C,
-    engine: &Handle,
+    world: &World,
     target: Position,
     config: Config,
 ) -> Result<Report, Error<C::Error>>
@@ -130,7 +130,7 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    to_avoiding(client, engine, &Avoidance::new(), target, config).await
+    to_avoiding(client, world, &Avoidance::new(), target, config).await
 }
 
 /// Walks to `target` while excluding caller-declared semantic boundaries.
@@ -140,14 +140,14 @@ where
 /// Returns the same [`enum@Error`] vocabulary as [`to`].
 #[instrument(
     name = "viperzoo::actions::walk_to_avoiding",
-    skip(client, engine, avoidance),
+    skip(client, world, avoidance),
     fields(target_x = target.x().value(), target_y = target.y().value()),
     err(level = "debug"),
     ret(level = "debug")
 )]
 pub async fn to_avoiding<C>(
     client: &C,
-    engine: &Handle,
+    world: &World,
     avoidance: &Avoidance,
     target: Position,
     config: Config,
@@ -156,7 +156,7 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    run(client, engine, avoidance, target, config, None).await
+    run(client, world, avoidance, target, config, None).await
 }
 
 /// Walks to `target` with client-asset directional fixture collision.
@@ -166,14 +166,14 @@ where
 /// Returns the same [`enum@Error`] vocabulary as [`to`].
 #[instrument(
     name = "viperzoo::actions::walk_to_with_assets",
-    skip(client, engine, assets),
+    skip(client, world, assets),
     fields(target_x = target.x().value(), target_y = target.y().value()),
     err(level = "debug"),
     ret(level = "debug")
 )]
 pub async fn to_with_assets<C>(
     client: &C,
-    engine: &Handle,
+    world: &World,
     assets: &Catalog,
     target: Position,
     config: Config,
@@ -182,7 +182,7 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    to_with_assets_avoiding(client, engine, assets, &Avoidance::new(), target, config).await
+    to_with_assets_avoiding(client, world, assets, &Avoidance::new(), target, config).await
 }
 
 /// Walks to `target` with fixture collision and route-local avoidance.
@@ -192,14 +192,14 @@ where
 /// Returns the same [`enum@Error`] vocabulary as [`to_with_assets`].
 #[instrument(
     name = "viperzoo::actions::walk_to_with_assets_avoiding",
-    skip(client, engine, assets, avoidance),
+    skip(client, world, assets, avoidance),
     fields(target_x = target.x().value(), target_y = target.y().value()),
     err(level = "debug"),
     ret(level = "debug")
 )]
 pub async fn to_with_assets_avoiding<C>(
     client: &C,
-    engine: &Handle,
+    world: &World,
     assets: &Catalog,
     avoidance: &Avoidance,
     target: Position,
@@ -209,19 +209,19 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    run(client, engine, avoidance, target, config, Some(assets)).await
+    run(client, world, avoidance, target, config, Some(assets)).await
 }
 
 #[instrument(
     name = "viperzoo::actions::walk::run",
-    skip(client, engine, assets, avoidance),
+    skip(client, world, assets, avoidance),
     fields(target_x = target.x().value(), target_y = target.y().value(), assets = assets.is_some()),
     err(level = "debug"),
     ret(level = "debug")
 )]
 async fn run<C>(
     client: &C,
-    engine: &Handle,
+    world: &World,
     avoidance: &Avoidance,
     target: Position,
     config: Config,
@@ -231,9 +231,9 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    let mut snapshots = engine.subscribe();
+    let mut snapshots = world.subscribe();
     let mut attempts = bootstrap(client, &mut snapshots, config).await?;
-    let epoch = snapshots.borrow().map().epoch();
+    let epoch = snapshots.latest().map().epoch();
     let mut knowledge = Knowledge::new();
     let mut learned_edges = 0_u32;
     let mut revalidation_epochs = 0_u8;
@@ -241,7 +241,7 @@ where
     let mut crossing: Option<Edge> = None;
 
     'walk: loop {
-        let snapshot = snapshots.borrow().clone();
+        let snapshot = snapshots.latest();
 
         let observed = snapshot.map().epoch();
 
@@ -343,9 +343,9 @@ where
                     time::sleep(config.settle_delay).await;
                     continue 'walk;
                 }
-                Err(WaitError::Stopped) => return Err(Error::EngineStopped),
+                Err(WaitError::Stopped) => return Err(Error::WorldStopped),
                 Err(WaitError::Timeout)
-                    if snapshots.borrow().entities_at(destination).next().is_some() =>
+                    if snapshots.latest().entities_at(destination).next().is_some() =>
                 {
                     debug!(
                         x = destination.x().value(),
@@ -376,7 +376,7 @@ where
 )]
 async fn bootstrap<C>(
     client: &C,
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    snapshots: &mut Subscription,
     config: Config,
 ) -> Result<u32, Error<C::Error>>
 where
@@ -387,7 +387,7 @@ where
     // the player's projected position.  Do not add a force-response/refresh
     // round trip in that latency-sensitive window: it is both unnecessary and
     // creates avoidable client activity during the transition.
-    if localized(&snapshots.borrow()) {
+    if localized(&snapshots.latest()) {
         return Ok(0);
     }
 
@@ -396,19 +396,19 @@ where
         .await
         .map_err(Error::Client)?;
 
-    if !localized(&snapshots.borrow()) {
+    if !localized(&snapshots.latest()) {
         client
             .perform(action::Action::RefreshMap)
             .await
             .map_err(Error::Client)?;
 
         match wait_until(snapshots, config.readiness_timeout, localized).await {
-            Err(WaitError::Stopped) => return Err(Error::EngineStopped),
+            Err(WaitError::Stopped) => return Err(Error::WorldStopped),
             Ok(()) | Err(WaitError::Timeout) => {}
         }
     }
 
-    if localized(&snapshots.borrow()) {
+    if localized(&snapshots.latest()) {
         Ok(0)
     } else {
         localize(client, snapshots, config.step_timeout).await
@@ -427,7 +427,7 @@ fn localized(snapshot: &Snapshot) -> bool {
 )]
 async fn localize<C>(
     client: &C,
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    snapshots: &mut Subscription,
     timeout: Duration,
 ) -> Result<u32, Error<C::Error>>
 where
@@ -450,7 +450,7 @@ where
 
         match wait_until(snapshots, timeout, localized).await {
             Ok(()) => return Ok(attempts),
-            Err(WaitError::Stopped) => return Err(Error::EngineStopped),
+            Err(WaitError::Stopped) => return Err(Error::WorldStopped),
             Err(WaitError::Timeout) => {}
         }
     }
@@ -459,28 +459,19 @@ where
 }
 
 async fn wait_for_step(
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    snapshots: &mut Subscription,
     origin: Position,
     destination: Position,
     direction: Direction,
     timeout: Duration,
 ) -> Result<StepOutcome, WaitError> {
-    if let Some(outcome) = step_outcome(&snapshots.borrow(), origin, destination, direction) {
-        return Ok(outcome);
-    }
-
-    time::timeout(timeout, async {
-        loop {
-            snapshots.changed().await.map_err(|_| WaitError::Stopped)?;
-
-            if let Some(outcome) = step_outcome(&snapshots.borrow(), origin, destination, direction)
-            {
-                return Ok(outcome);
-            }
-        }
-    })
-    .await
-    .map_err(|_| WaitError::Timeout)?
+    snapshots
+        .wait(query::select(move |snapshot| {
+            step_outcome(snapshot, origin, destination, direction)
+        }))
+        .within(timeout)
+        .await
+        .map_err(wait_error)
 }
 
 fn step_outcome(
@@ -510,25 +501,22 @@ fn step_outcome(
 }
 
 async fn wait_until(
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    snapshots: &mut Subscription,
     timeout: Duration,
     predicate: impl Fn(&Snapshot) -> bool,
 ) -> Result<(), WaitError> {
-    if predicate(&snapshots.borrow()) {
-        return Ok(());
+    snapshots
+        .wait(query::when(predicate))
+        .within(timeout)
+        .await
+        .map_err(wait_error)
+}
+
+const fn wait_error(error: WorldWaitError) -> WaitError {
+    match error {
+        WorldWaitError::Closed => WaitError::Stopped,
+        WorldWaitError::Elapsed { .. } => WaitError::Timeout,
     }
-
-    time::timeout(timeout, async {
-        loop {
-            snapshots.changed().await.map_err(|_| WaitError::Stopped)?;
-
-            if predicate(&snapshots.borrow()) {
-                return Ok(());
-            }
-        }
-    })
-    .await
-    .map_err(|_| WaitError::Timeout)?
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -558,9 +546,9 @@ where
     /// Player position remained unavailable after refresh and bounded probes.
     #[error("player position is unavailable after refresh and four live localization probes")]
     StateUnavailable,
-    /// The canonical engine stopped during the run.
-    #[error("canonical engine stopped during destination walking")]
-    EngineStopped,
+    /// The canonical world stopped during the run.
+    #[error("canonical world stopped during destination walking")]
+    WorldStopped,
     /// Map identity became known after the target was planned without it.
     ///
     /// A warm attachment plans against provisional coverage. The first
@@ -604,121 +592,127 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        convert::Infallible,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     };
 
-    use viperzoo_engine::Config as EngineConfig;
-    use viperzoo_protocol::{decode, direction::Flow};
+    use viperzoo_adapter_api::action::MockClient;
+    use viperzoo_engine::{Config as EngineConfig, Ingress};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+    };
 
     use super::*;
 
-    #[derive(Clone)]
-    struct TransitioningClient {
-        engine: Handle,
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
     }
 
-    #[derive(Clone, Default)]
-    struct CountingClient {
+    fn transitioning_client(ingress: Ingress) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+
+            Box::pin(async move {
+                if matches!(action, action::Action::Step(_)) {
+                    for body in [
+                        "1512680011001105000757656c636f6d6500e80002020200",
+                        "04000500050003000100410000",
+                    ] {
+                        let bytes = hex::decode(body).expect("fixture hex is valid");
+                        let packet =
+                            decode(Flow::Clientbound, &bytes).expect("fixture packet decodes");
+                        ingress
+                            .observe(packet.into())
+                            .await
+                            .expect("test engine remains available");
+                    }
+                }
+
+                Ok(())
+            })
+        });
+        client
+    }
+
+    fn counting_client(
         map_data_requests: Arc<AtomicUsize>,
         refresh_requests: Arc<AtomicUsize>,
-    }
-
-    #[derive(Clone)]
-    struct ObstructingClient {
-        engine: Handle,
-        directions: Arc<Mutex<Vec<Direction>>>,
-    }
-
-    impl Client for CountingClient {
-        type Error = Infallible;
-
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
+    ) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
             match action {
                 action::Action::MapData(_) => {
-                    self.map_data_requests.fetch_add(1, Ordering::Relaxed);
+                    map_data_requests.fetch_add(1, Ordering::Relaxed);
                 }
                 action::Action::RefreshMap => {
-                    self.refresh_requests.fetch_add(1, Ordering::Relaxed);
+                    refresh_requests.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => {}
             }
 
-            Ok(())
-        }
+            Box::pin(std::future::ready(Ok(())))
+        });
+        client
     }
 
-    impl Client for TransitioningClient {
-        type Error = Infallible;
+    fn obstructing_client(
+        ingress: Ingress,
+        world: World,
+        directions: Arc<Mutex<Vec<Direction>>>,
+    ) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+            let world = world.clone();
+            let directions = Arc::clone(&directions);
 
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            if !matches!(action, action::Action::Step(_)) {
-                return Ok(());
-            }
+            Box::pin(async move {
+                let action::Action::Step(direction) = action else {
+                    return Ok(());
+                };
+                directions
+                    .lock()
+                    .expect("test direction log remains available")
+                    .push(direction);
 
-            for body in [
-                "1512680011001105000757656c636f6d6500e80002020200",
-                "04000500050003000100410000",
-            ] {
-                let bytes = hex::decode(body).expect("fixture hex is valid");
-                let packet = decode(Flow::Clientbound, &bytes).expect("fixture packet decodes");
-                self.engine
+                let position = world
+                    .latest()
+                    .player()
+                    .location()
+                    .position()
+                    .expect("test fixture is localized");
+                let body = format!(
+                    "69{:04x}{:04x}{:02x}00",
+                    position.x().value(),
+                    position.y().value(),
+                    direction.to_wire(),
+                );
+                let packet = decode(
+                    Flow::Serverbound,
+                    &hex::decode(body).expect("constructed obstruction body is valid hex"),
+                )
+                .expect("constructed obstruction body is structurally valid");
+                ingress
                     .observe(packet.into())
                     .await
                     .expect("test engine remains available");
-            }
 
-            Ok(())
-        }
-    }
-
-    impl Client for ObstructingClient {
-        type Error = Infallible;
-
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            let action::Action::Step(direction) = action else {
-                return Ok(());
-            };
-            self.directions
-                .lock()
-                .expect("test direction log remains available")
-                .push(direction);
-
-            let position = self
-                .engine
-                .snapshot()
-                .player()
-                .location()
-                .position()
-                .expect("test fixture is localized");
-            let body = format!(
-                "69{:04x}{:04x}{:02x}00",
-                position.x().value(),
-                position.y().value(),
-                direction.to_wire(),
-            );
-            let packet = decode(
-                Flow::Serverbound,
-                &hex::decode(body).expect("constructed obstruction body is valid hex"),
-            )
-            .expect("constructed obstruction body is structurally valid");
-            self.engine
-                .observe(packet.into())
-                .await
-                .expect("test engine remains available");
-
-            Ok(())
-        }
+                Ok(())
+            })
+        });
+        client
     }
 
     #[tokio::test]
     async fn map_transition_invalidates_numeric_destination() {
-        let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
-        let owner = tokio::spawn(task.run());
+        let channel = viperzoo_engine::channel(EngineConfig::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
 
         for body in [
             "1512670011001105000757656c636f6d6500e80002020200",
@@ -726,30 +720,31 @@ mod tests {
         ] {
             let bytes = hex::decode(body).expect("fixture hex is valid");
             let packet = decode(Flow::Clientbound, &bytes).expect("fixture packet decodes");
-            engine
+            ingress
                 .observe(packet.into())
                 .await
                 .expect("test engine remains available");
         }
 
-        let client = TransitioningClient {
-            engine: engine.clone(),
-        };
-        let result = to(&client, &engine, Position::new(3, 0), Config::default()).await;
+        let client = transitioning_client(ingress.clone());
+        let result = to(&client, &world, Position::new(3, 0), Config::default()).await;
 
         assert!(matches!(
             result,
             Err(Error::MapChanged { from: 1, to: 2, .. })
         ));
 
-        engine.shutdown().await.expect("engine shuts down");
+        drop(client);
+        drop(ingress);
         owner.await.expect("engine owner joins");
     }
 
     #[tokio::test]
     async fn localized_bootstrap_does_not_refresh_the_new_map() {
-        let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
-        let owner = tokio::spawn(task.run());
+        let channel = viperzoo_engine::channel(EngineConfig::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
 
         for body in [
             "1512670011001105000757656c636f6d6500e80002020200",
@@ -757,53 +752,57 @@ mod tests {
         ] {
             let bytes = hex::decode(body).expect("fixture hex is valid");
             let packet = decode(Flow::Clientbound, &bytes).expect("fixture packet decodes");
-            engine
+            ingress
                 .observe(packet.into())
                 .await
                 .expect("test engine remains available");
         }
 
-        let client = CountingClient::default();
-        let mut snapshots = engine.subscribe();
+        let map_data_requests = Arc::new(AtomicUsize::new(0));
+        let refresh_requests = Arc::new(AtomicUsize::new(0));
+        let client = counting_client(
+            Arc::clone(&map_data_requests),
+            Arc::clone(&refresh_requests),
+        );
+        let mut snapshots = world.subscribe();
         let attempts = bootstrap(&client, &mut snapshots, Config::default())
             .await
             .expect("localized projection needs no bootstrap action");
 
         assert_eq!(attempts, 0);
-        assert_eq!(client.map_data_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(client.refresh_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(map_data_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(refresh_requests.load(Ordering::Relaxed), 0);
 
-        engine.shutdown().await.expect("engine shuts down");
+        drop(ingress);
         owner.await.expect("engine owner joins");
     }
 
     #[tokio::test]
     async fn reported_obstruction_replans_instead_of_repeating_the_same_edge() {
-        let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
-        let owner = tokio::spawn(task.run());
+        let channel = viperzoo_engine::channel(EngineConfig::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
 
         let packet = decode(
             Flow::Clientbound,
             &hex::decode("04000300010003000100410000").expect("fixture hex is valid"),
         )
         .expect("fixture packet decodes");
-        engine
+        ingress
             .observe(packet.into())
             .await
             .expect("test engine remains available");
 
         let directions = Arc::new(Mutex::new(Vec::new()));
-        let client = ObstructingClient {
-            engine: engine.clone(),
-            directions: directions.clone(),
-        };
+        let client = obstructing_client(ingress.clone(), world.clone(), Arc::clone(&directions));
         let config = Config::new(
             Duration::from_millis(20),
             Duration::from_millis(20),
             Duration::ZERO,
             2,
         );
-        let result = to(&client, &engine, Position::new(4, 1), config).await;
+        let result = to(&client, &world, Position::new(4, 1), config).await;
 
         assert!(matches!(result, Err(Error::Attempts(2))));
         {
@@ -815,7 +814,8 @@ mod tests {
             assert_ne!(directions[1], Direction::Right);
         }
 
-        engine.shutdown().await.expect("engine shuts down");
+        drop(client);
+        drop(ingress);
         owner.await.expect("engine owner joins");
     }
 }

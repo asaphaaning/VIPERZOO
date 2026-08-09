@@ -9,15 +9,16 @@
 //! It also writes optional evidence records beside direct delivery, so recording
 //! failure can be reported without interrupting the live projection path.
 
-use std::sync::mpsc::Sender;
-
+use bytes::BytesMut;
 use frida::{Message as FridaMessage, ScriptHandler};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::codec::Decoder;
 use tracing::{debug, warn};
-use viperzoo_adapter_api::observation::Observation;
-use viperzoo_engine::Handle;
-use viperzoo_protocol::{decode, direction::Flow};
+use viperzoo_adapter_api::observation::{self, Observation};
+use viperzoo_capture::frame::Operation;
+use viperzoo_protocol::{codec::Codec, direction::Flow};
 
 use crate::{
     event::{Event, Info, Problem, Rejection, SocketOperation, TransportFault},
@@ -27,22 +28,25 @@ use crate::{
 pub(crate) const SOURCE: &str = include_str!("agent.js");
 
 #[derive(Debug)]
-pub(crate) struct Handler {
-    engine: Handle,
-    events: Sender<Event>,
+pub(crate) struct Handler<S> {
+    ingress: S,
+    events: UnboundedSender<Event>,
     info: Info,
     recorder: Recorder,
 }
 
-impl Handler {
+impl<S> Handler<S>
+where
+    S: observation::Sink,
+{
     pub(crate) fn new(
-        engine: Handle,
-        events: Sender<Event>,
+        ingress: S,
+        events: UnboundedSender<Event>,
         info: Info,
         recorder: Recorder,
     ) -> Self {
         Self {
-            engine,
+            ingress,
             events,
             info,
             recorder,
@@ -142,7 +146,7 @@ impl Handler {
             ));
         }
 
-        if let Err(error) = self.engine.observe_blocking(Observation::TransportClosed) {
+        if let Err(error) = self.ingress.observe_blocking(Observation::TransportClosed) {
             self.send(Event::Rejected(Rejection::new(None, 0, error.to_string())));
             return;
         }
@@ -171,12 +175,12 @@ impl Handler {
             ));
             return;
         };
-        let operation_name = match operation {
-            SocketOperation::Receive => "receive",
-            SocketOperation::Send => "send",
+        let capture_operation = match operation {
+            SocketOperation::Receive => Operation::Receive,
+            SocketOperation::Send => Operation::Send,
         };
 
-        if let Err(error) = self.recorder.transport_fault(operation_name, code) {
+        if let Err(error) = self.recorder.transport_fault(capture_operation, code) {
             self.send(Event::Warning(
                 format!("raw JSONL recording stopped: {error}").into(),
             ));
@@ -207,6 +211,18 @@ impl Handler {
             )));
             return;
         };
+        let Some(length) = payload
+            .get("length")
+            .and_then(Value::as_u64)
+            .and_then(|length| usize::try_from(length).ok())
+        else {
+            self.send(Event::Rejected(Rejection::new(
+                Some(flow),
+                data.len(),
+                "packet callback has no supported body length",
+            )));
+            return;
+        };
 
         let thread_id = payload
             .get("threadId")
@@ -219,8 +235,17 @@ impl Handler {
             ));
         }
 
-        let packet = match decode(flow, data) {
-            Ok(packet) => packet,
+        let mut source = BytesMut::from(data);
+        let packet = match Codec::new(flow, length).decode_eof(&mut source) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => {
+                self.send(Event::Rejected(Rejection::new(
+                    Some(flow),
+                    data.len(),
+                    "complete packet callback produced no protocol packet",
+                )));
+                return;
+            }
             Err(error) => {
                 self.send(Event::Rejected(Rejection::new(
                     Some(flow),
@@ -231,7 +256,7 @@ impl Handler {
             }
         };
 
-        if let Err(error) = self.engine.observe_blocking(packet.into()) {
+        if let Err(error) = self.ingress.observe_blocking(packet.into()) {
             self.send(Event::Rejected(Rejection::new(
                 Some(flow),
                 data.len(),
@@ -241,7 +266,10 @@ impl Handler {
     }
 }
 
-impl ScriptHandler for Handler {
+impl<S> ScriptHandler for Handler<S>
+where
+    S: observation::Sink,
+{
     fn on_message(&mut self, message: FridaMessage, data: Option<Vec<u8>>) {
         self.handle(message, data.as_deref());
     }

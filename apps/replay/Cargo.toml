@@ -9,6 +9,9 @@ version.workspace      = true
 serde.workspace              = true
 serde_json.workspace         = true
 thiserror.workspace          = true
+tokio = { workspace = true, features = [ "fs", "io-util", "macros", "rt" ] }
+tokio-stream.workspace       = true
+tokio-util.workspace         = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 viperzoo-adapter-api         = { version = "0.1.0", path = "../../crates/adapter-api" }

@@ -1,20 +1,25 @@
 //! Serialize live observations through one bounded asynchronous owner.
 //!
-//! [`Handle`] is cloneable so adapters and controllers can submit observations
-//! concurrently. [`Task`] receives them through a bounded channel, applies
-//! them in order through [`crate::Reducer`], replies with a [`Receipt`], and
-//! publishes only complete `Arc<Snapshot>` revisions through a watch channel.
+//! [`Channel`] separates the three capabilities of a live engine. Cloneable
+//! [`Ingress`] values submit observations, cloneable [`World`] values read
+//! immutable snapshots, and one [`Owner`] reduces every accepted observation.
+//! The types make observation authority, knowledge access, and runtime
+//! ownership distinct instead of granting all three to every caller.
 //!
 //! Backpressure is intentional: an acquisition boundary must slow down rather
 //! than let an unbounded queue hide lost responsiveness or memory growth.
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, instrument};
-use viperzoo_adapter_api::observation::Observation;
-use viperzoo_world::{snapshot::Snapshot, world::Change};
+use viperzoo_adapter_api::observation::{self, Observation};
+use viperzoo_world::{
+    query::{Query, State},
+    snapshot::Snapshot,
+    world::Change,
+};
 
 use crate::Reducer;
 
@@ -60,19 +65,63 @@ impl Receipt {
     }
 }
 
-/// Cloneable command and snapshot handle for a running [`Task`].
-#[derive(Clone, Debug)]
-pub struct Handle {
-    commands: mpsc::Sender<Command>,
-    snapshots: watch::Receiver<Arc<Snapshot>>,
+/// The connected capabilities of one live engine.
+///
+/// Clone the capabilities needed by each participant before consuming the
+/// channel with [`Channel::owner`]:
+///
+/// ```no_run
+/// # async fn run() {
+/// let channel = viperzoo_engine::channel(viperzoo_engine::Config::default());
+/// let ingress = channel.ingress();
+/// let world = channel.world();
+/// let owner = tokio::spawn(channel.owner().run());
+///
+/// drop(ingress);
+/// owner.await.expect("engine owner does not panic");
+///
+/// let _snapshot = world.latest();
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "the engine channel must be divided into the capabilities its runtime needs"]
+pub struct Channel {
+    ingress: Ingress,
+    world: World,
+    owner: Owner,
 }
 
-impl Handle {
+impl Channel {
+    /// Returns a cloneable observation capability.
+    #[must_use]
+    pub fn ingress(&self) -> Ingress {
+        self.ingress.clone()
+    }
+
+    /// Returns a cloneable canonical-world capability.
+    #[must_use]
+    pub fn world(&self) -> World {
+        self.world.clone()
+    }
+
+    /// Consumes the channel and returns its single runtime owner.
+    pub fn owner(self) -> Owner {
+        self.owner
+    }
+}
+
+/// Cloneable authority to submit observations to a running [`Owner`].
+#[derive(Clone, Debug)]
+pub struct Ingress {
+    commands: mpsc::Sender<Command>,
+}
+
+impl Ingress {
     /// Orders one observation and waits until it is reflected in snapshots.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Stopped`] if the owner [`Task`] has stopped.
+    /// Returns [`Error::Stopped`] if the [`Owner`] has stopped.
     #[instrument(
         name = "viperzoo::engine::observe",
         skip(self, observation),
@@ -99,11 +148,11 @@ impl Handle {
     /// # Panics
     ///
     /// Panics when called from within an asynchronous Tokio execution context.
-    /// Use [`Handle::observe`] there instead.
+    /// Use [`Ingress::observe`] there instead.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Stopped`] if the owner [`Task`] has stopped.
+    /// Returns [`Error::Stopped`] if the [`Owner`] has stopped.
     #[instrument(
         name = "viperzoo::engine::observe_blocking",
         skip(self, observation),
@@ -123,51 +172,180 @@ impl Handle {
 
         receipt.blocking_recv().map_err(|_| Error::Stopped)
     }
+}
 
-    /// Returns the latest internally consistent snapshot without waiting.
-    #[must_use]
-    pub fn snapshot(&self) -> Arc<Snapshot> {
-        Arc::clone(&self.snapshots.borrow())
-    }
-
-    /// Subscribes to future canonical snapshot revisions.
-    #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
-        self.snapshots.clone()
-    }
-
-    /// Requests an orderly engine stop after all prior commands.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Stopped`] if the owner [`Task`] has already stopped.
-    #[instrument(
-        name = "viperzoo::engine::shutdown",
-        skip(self),
-        err,
-        ret(level = "debug")
-    )]
-    pub async fn shutdown(&self) -> Result<(), Error> {
-        self.commands
-            .send(Command::Shutdown)
+impl observation::Sink for Ingress {
+    async fn observe(&self, observation: Observation) -> Result<(), observation::Error> {
+        Ingress::observe(self, observation)
             .await
-            .map_err(|_| Error::Stopped)
+            .map(|_| ())
+            .map_err(|Error::Stopped| observation::Error::Closed)
+    }
+
+    fn observe_blocking(&self, observation: Observation) -> Result<(), observation::Error> {
+        Ingress::observe_blocking(self, observation)
+            .map(|_| ())
+            .map_err(|Error::Stopped| observation::Error::Closed)
     }
 }
 
-/// Lazy single-owner engine task.
-///
-/// Nothing is reduced until [`Task::run`] is awaited or spawned.
+/// Cloneable read access to the canonical world of a running [`Owner`].
+#[derive(Clone, Debug)]
+pub struct World {
+    snapshots: watch::Receiver<Arc<Snapshot>>,
+}
+
+impl World {
+    /// Returns the latest internally consistent snapshot without waiting.
+    #[must_use]
+    pub fn latest(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.snapshots.borrow())
+    }
+
+    /// Atomically captures the latest snapshot and future revisions.
+    ///
+    /// [`Subscription::latest`] and the first [`Subscription::changed`] call
+    /// meet without a gap or duplicate revision.
+    #[must_use]
+    pub fn subscribe(&self) -> Subscription {
+        let mut snapshots = self.snapshots.clone();
+        let latest = Arc::clone(&snapshots.borrow_and_update());
+
+        Subscription { latest, snapshots }
+    }
+
+    /// Prepares to resolve a pure world [`Query`] over current and future
+    /// revisions.
+    pub fn wait<Q>(&self, query: Q) -> Wait<'static, Q>
+    where
+        Q: Query,
+    {
+        Wait {
+            source: Source::Owned(self.subscribe()),
+            query,
+        }
+    }
+}
+
+/// Gap-free view of one current snapshot followed by future revisions.
 #[derive(Debug)]
-#[must_use = "the engine task must be run for its handle to make progress"]
-pub struct Task {
+pub struct Subscription {
+    latest: Arc<Snapshot>,
+    snapshots: watch::Receiver<Arc<Snapshot>>,
+}
+
+impl Subscription {
+    /// Returns the latest snapshot observed by this subscription.
+    #[must_use]
+    pub fn latest(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.latest)
+    }
+
+    /// Waits for and returns the next canonical snapshot revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriptionError::Closed`] when the engine owner stops.
+    pub async fn changed(&mut self) -> Result<Arc<Snapshot>, SubscriptionError> {
+        self.snapshots
+            .changed()
+            .await
+            .map_err(|_| SubscriptionError::Closed)?;
+        self.latest = Arc::clone(&self.snapshots.borrow_and_update());
+
+        Ok(self.latest())
+    }
+
+    /// Prepares to resolve a [`Query`] without losing this subscription's
+    /// current revision fence.
+    pub fn wait<Q>(&mut self, query: Q) -> Wait<'_, Q>
+    where
+        Q: Query,
+    {
+        Wait {
+            source: Source::Borrowed(self),
+            query,
+        }
+    }
+}
+
+/// A lazy query wait over current and future world revisions.
+#[derive(Debug)]
+#[must_use = "a world wait has no effect until run or within is awaited"]
+pub struct Wait<'a, Q> {
+    source: Source<'a>,
+    query: Q,
+}
+
+impl<Q> Wait<'_, Q>
+where
+    Q: Query,
+{
+    /// Waits without a deadline until the query resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError::Closed`] when the engine owner stops first.
+    pub async fn run(mut self) -> Result<Q::Output, WaitError> {
+        loop {
+            if let State::Ready(value) = self.query.evaluate(&self.source.latest()) {
+                return Ok(value);
+            }
+
+            self.source.changed().await?;
+        }
+    }
+
+    /// Waits up to `duration` for the query to resolve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WaitError::Elapsed`] when the deadline passes or
+    /// [`WaitError::Closed`] when the engine owner stops first.
+    pub async fn within(self, duration: Duration) -> Result<Q::Output, WaitError> {
+        tokio::time::timeout(duration, self.run())
+            .await
+            .map_err(|_| WaitError::Elapsed { duration })?
+    }
+}
+
+#[derive(Debug)]
+enum Source<'a> {
+    Owned(Subscription),
+    Borrowed(&'a mut Subscription),
+}
+
+impl Source<'_> {
+    fn latest(&self) -> Arc<Snapshot> {
+        match self {
+            Self::Owned(subscription) => subscription.latest(),
+            Self::Borrowed(subscription) => subscription.latest(),
+        }
+    }
+
+    async fn changed(&mut self) -> Result<Arc<Snapshot>, SubscriptionError> {
+        match self {
+            Self::Owned(subscription) => subscription.changed().await,
+            Self::Borrowed(subscription) => subscription.changed().await,
+        }
+    }
+}
+
+/// Lazy single-owner engine runtime.
+///
+/// Nothing is reduced until [`Owner::run`] is awaited or spawned. The owner
+/// drains every accepted observation and finishes after the last [`Ingress`]
+/// is dropped.
+#[derive(Debug)]
+#[must_use = "the engine owner must be run for its ingress to make progress"]
+pub struct Owner {
     commands: mpsc::Receiver<Command>,
     snapshots: watch::Sender<Arc<Snapshot>>,
     reducer: Reducer,
 }
 
-impl Task {
-    /// Owns and reduces observations until shutdown or the last [`Handle`] is dropped.
+impl Owner {
+    /// Reduces observations until every [`Ingress`] has been dropped.
     #[instrument(name = "viperzoo::engine::run", skip(self))]
     pub async fn run(mut self) {
         while let Some(command) = self.commands.recv().await {
@@ -184,34 +362,33 @@ impl Task {
                         "ordered observation reduced"
                     );
                 }
-                Command::Shutdown => break,
             }
         }
     }
 }
 
-/// Creates a connected [`Handle`] and lazy owner [`Task`].
+/// Creates the connected capabilities of one live engine.
 #[instrument(
     name = "viperzoo::engine::channel",
     fields(capacity = config.capacity().get()),
     ret(level = "trace")
 )]
-pub fn channel(config: Config) -> (Handle, Task) {
+pub fn channel(config: Config) -> Channel {
     let reducer = Reducer::new();
     let (commands, receiver) = mpsc::channel(config.capacity().get());
     let (snapshots, subscription) = watch::channel(Arc::new(reducer.snapshot()));
 
-    (
-        Handle {
-            commands,
+    Channel {
+        ingress: Ingress { commands },
+        world: World {
             snapshots: subscription,
         },
-        Task {
+        owner: Owner {
             commands: receiver,
             snapshots,
             reducer,
         },
-    )
+    }
 }
 
 const fn observation_name(observation: &Observation) -> &'static str {
@@ -231,60 +408,165 @@ enum Command {
         observation: Box<Observation>,
         reply: oneshot::Sender<Receipt>,
     },
-    Shutdown,
 }
 
 /// Engine command failure.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// The owner task stopped before accepting or acknowledging the command.
-    #[error("engine task has stopped")]
+    /// The owner stopped before accepting or acknowledging the observation.
+    #[error("engine owner has stopped")]
     Stopped,
+}
+
+/// Failure while advancing an atomic [`Subscription`].
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SubscriptionError {
+    /// The engine owner stopped before another revision was published.
+    #[error("canonical world subscription is closed")]
+    Closed,
+}
+
+impl From<SubscriptionError> for WaitError {
+    fn from(error: SubscriptionError) -> Self {
+        match error {
+            SubscriptionError::Closed => Self::Closed,
+        }
+    }
+}
+
+/// Failure while waiting for a world [`Query`].
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum WaitError {
+    /// The engine owner stopped before the query resolved.
+    #[error("canonical world closed before the query resolved")]
+    Closed,
+    /// The query remained pending for the complete deadline.
+    #[error("world query did not resolve within {duration:?}")]
+    Elapsed {
+        /// Configured wait duration.
+        duration: Duration,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use viperzoo_protocol::{decode, direction::Flow, primitive::Position};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+        primitive::Position,
+    };
+    use viperzoo_world::{query, revision::Revision};
 
     use super::*;
 
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
+    }
+
     #[tokio::test]
     async fn observations_are_acknowledged_after_snapshot_publication() {
-        let (handle, task) = channel(Config::default());
-        let owner = tokio::spawn(task.run());
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
         let bytes = hex::decode("04000300010003000100410000").expect("fixture hex is valid");
         let packet = decode(Flow::Clientbound, &bytes).expect("fixture packet is valid");
 
-        let receipt = handle
+        let receipt = ingress
             .observe(packet.into())
             .await
             .expect("engine is running");
 
         assert!(receipt.change().is_projected());
         assert_eq!(
-            handle.snapshot().player().location().position(),
+            world.latest().player().location().position(),
             Some(Position::new(3, 1))
         );
 
-        handle.shutdown().await.expect("engine is running");
-        owner.await.expect("engine task does not panic");
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
     }
 
     #[tokio::test]
-    async fn subscribers_receive_each_canonical_revision() {
-        let (handle, task) = channel(Config::default());
-        let owner = tokio::spawn(task.run());
-        let mut snapshots = handle.subscribe();
+    async fn subscribers_receive_the_latest_published_revision() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+        let mut snapshots = world.subscribe();
 
-        handle
+        ingress
             .observe(Observation::SessionStarted)
             .await
             .expect("engine is running");
         snapshots.changed().await.expect("publisher is alive");
 
-        assert_eq!(snapshots.borrow().revision().value(), 1);
+        assert_eq!(snapshots.latest().revision().value(), 1);
 
-        handle.shutdown().await.expect("engine is running");
-        owner.await.expect("engine task does not panic");
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn subscription_snapshot_and_future_revisions_meet_without_a_gap() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+
+        ingress
+            .observe(Observation::SessionStarted)
+            .await
+            .expect("engine is running");
+
+        let mut subscription = world.subscribe();
+        assert_eq!(subscription.latest().revision().value(), 1);
+
+        ingress
+            .observe(Observation::TransportClosed)
+            .await
+            .expect("engine is running");
+        let changed = subscription.changed().await.expect("publisher is alive");
+        assert_eq!(changed.revision().value(), 2);
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn queries_resolve_immediately_from_the_atomic_current_snapshot() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+
+        ingress
+            .observe(Observation::SessionStarted)
+            .await
+            .expect("engine is running");
+
+        let revision = world
+            .wait(query::after(Revision::INITIAL))
+            .within(Duration::from_millis(10))
+            .await
+            .expect("current snapshot already resolves the query");
+        assert_eq!(revision.value(), 1);
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn world_readers_do_not_keep_the_owner_alive() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+
+        assert_eq!(world.latest().revision().value(), 0);
     }
 }

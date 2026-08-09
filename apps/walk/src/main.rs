@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use thiserror::Error;
 use tracing::{info, instrument};
 use viperzoo_adapter_frida as frida;
-use viperzoo_sdk::{actions, assets, engine, protocol::primitive::Position};
+use viperzoo_sdk::{Session, actions, assets, protocol::primitive::Position};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -24,7 +24,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(config).await {
+    match Box::pin(run(config)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(%error, "destination walk failed");
@@ -41,13 +41,14 @@ async fn main() -> ExitCode {
     ret(level = "debug")
 )]
 async fn run(config: cli::Config) -> Result<(), Error> {
-    let (engine, task) = engine::channel(engine::Config::default());
-    let owner = tokio::spawn(task.run());
-    let attachment = frida::attach(
+    let adapter = frida::Adapter::new(
         frida::Config::new(config.client().clone()).with_recording(config.recording().clone()),
-        engine.clone(),
-    )?;
-    let control = attachment.control();
+    );
+    let session = Session::builder(adapter).start().await?;
+    let control = session.client;
+    let _events = session.events;
+    let world = session.world;
+    let owner = session.owner;
     let target = Position::new(config.x(), config.y());
     let assets = assets::load_default()?;
     info!(
@@ -57,21 +58,17 @@ async fn run(config: cli::Config) -> Result<(), Error> {
     );
     let result = actions::walk::to_with_assets(
         &control,
-        &engine,
+        &world,
         &assets,
         target,
         actions::walk::Config::default(),
     )
     .await;
 
-    let adapter = attachment.stop().await;
-    let shutdown = engine.shutdown().await;
-    let owner = owner.await;
+    let session = owner.shutdown().await;
     let report = result?;
 
-    adapter?;
-    shutdown?;
-    owner?;
+    session?;
 
     info!(
         x = report.target().x().value(),
@@ -88,13 +85,9 @@ async fn run(config: cli::Config) -> Result<(), Error> {
 #[derive(Debug, Error)]
 enum Error {
     #[error(transparent)]
-    Frida(#[from] frida::Error),
+    Session(#[from] viperzoo_sdk::Error<frida::Error>),
     #[error(transparent)]
     Walk(#[from] actions::walk::Error<frida::ActionError>),
-    #[error(transparent)]
-    Engine(#[from] engine::Error),
-    #[error("engine owner failed: {0}")]
-    Owner(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Assets(#[from] assets::LoadError),
 }

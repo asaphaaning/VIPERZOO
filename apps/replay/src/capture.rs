@@ -1,16 +1,16 @@
 //! Finite JSONL replay into the deterministic world reducer.
 
-use std::{
-    io::BufRead,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use thiserror::Error;
+use tokio::io::AsyncRead;
+use tokio_stream::StreamExt;
+use tokio_util::codec::FramedRead;
 use tracing::{debug, instrument};
 use viperzoo_adapter_api::observation::Observation;
 use viperzoo_capture::{
-    line::Line,
+    codec::{self, Codec},
     record::{self, Record},
 };
 use viperzoo_engine::Reducer;
@@ -52,9 +52,7 @@ impl Report {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Read`] when the source fails before yielding its next
-/// complete line, or [`Error::LineCapacity`] if it exceeds the supported line
-/// identity space.
+/// Returns [`Error::Capture`] when the source cannot be read or framed.
 #[instrument(
     name = "viperzoo::replay::capture",
     skip(reader),
@@ -62,24 +60,23 @@ impl Report {
     err,
     ret(level = "trace")
 )]
-pub fn replay(reader: impl BufRead, source: &Path) -> Result<Report, Error> {
+pub async fn replay(reader: impl AsyncRead + Unpin, source: &Path) -> Result<Report, Error> {
     let mut reducer = Reducer::new();
     let mut input_line_count = 0;
     let mut packet_row_count = 0;
     let mut skipped_row_count = 0;
     let mut session_start_count = 0;
     let mut diagnostics = Vec::new();
-    let mut line_number = Line::FIRST;
+    let mut records = FramedRead::new(reader, Codec::new());
 
-    for input in reader.lines() {
+    while let Some(record) = records.next().await {
         input_line_count += 1;
-        let input = input.map_err(|source_error| Error::Read {
+        let record = record.map_err(|source_error| Error::Capture {
             path: source.to_owned(),
-            line: line_number,
             source: source_error,
         })?;
 
-        match record::decode(line_number, &input) {
+        match record {
             Record::SessionStarted => {
                 session_start_count += 1;
                 let _ = reducer.observe(Observation::SessionStarted);
@@ -98,8 +95,6 @@ pub fn replay(reader: impl BufRead, source: &Path) -> Result<Report, Error> {
                 diagnostics.push(diagnostic);
             }
         }
-
-        line_number = line_number.next().ok_or(Error::LineCapacity)?;
     }
 
     Ok(Report {
@@ -116,19 +111,14 @@ pub fn replay(reader: impl BufRead, source: &Path) -> Result<Report, Error> {
 /// A fatal finite replay failure.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// The source stopped yielding complete lines.
-    #[error("unable to read {path} at line {line:?}: {source}")]
-    Read {
+    /// The source could not be read or framed as capture evidence.
+    #[error("unable to frame capture {path}: {source}")]
+    Capture {
         /// Capture source path.
         path: PathBuf,
-        /// One-based capture line.
-        line: Line,
-        /// Underlying stream error.
-        source: std::io::Error,
+        /// Underlying capture codec failure.
+        source: codec::Error,
     },
-    /// The stream exceeded the complete `u64` line identity space.
-    #[error("capture exceeds the supported line identity space")]
-    LineCapacity,
 }
 
 #[cfg(test)]
@@ -139,14 +129,15 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn replay_skips_non_packets_and_quarantines_malformed_known_packets() {
+    #[tokio::test]
+    async fn replay_skips_non_packets_and_quarantines_malformed_known_packets() {
         let input = concat!(
             "{\"type\":\"network-send\",\"hex\":\"aa00\"}\n",
             "{\"type\":\"packet\",\"direction\":\"incoming\",\"length\":24,\"hex\":\"1512670011001105000757656c636f6d6500e80002020200\"}\n",
             "{\"type\":\"packet\",\"direction\":\"incoming\",\"length\":2,\"hex\":\"1500\"}\n",
         );
         let report = replay(Cursor::new(input), Path::new("memory.jsonl"))
+            .await
             .expect("in-memory capture is readable");
 
         assert_eq!(report.skipped_row_count, 1);
@@ -156,10 +147,11 @@ mod tests {
         assert_eq!(report.snapshot().processed_packet_count(), 1);
     }
 
-    #[test]
-    fn captured_foundation_fixture_has_stable_projection() {
-        let fixture = include_str!("../../../fixtures/foundation.jsonl");
+    #[tokio::test]
+    async fn captured_foundation_fixture_has_stable_projection() {
+        let fixture = include_str!("../tests/data/foundation.jsonl");
         let report = replay(Cursor::new(fixture), Path::new("foundation.jsonl"))
+            .await
             .expect("fixture is readable");
         let snapshot = report.snapshot();
         let context = snapshot
@@ -187,12 +179,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn report_json_is_deterministic() {
-        let fixture = include_str!("../../../fixtures/foundation.jsonl");
+    #[tokio::test]
+    async fn report_json_is_deterministic() {
+        let fixture = include_str!("../tests/data/foundation.jsonl");
         let first = replay(Cursor::new(fixture), Path::new("foundation.jsonl"))
+            .await
             .expect("first fixture read succeeds");
         let second = replay(Cursor::new(fixture), Path::new("foundation.jsonl"))
+            .await
             .expect("second fixture read succeeds");
 
         assert_eq!(
@@ -201,23 +195,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn foundation_snapshot_matches_the_checked_in_golden_value() {
-        let fixture = include_str!("../../../fixtures/foundation.jsonl");
+    #[tokio::test]
+    async fn foundation_snapshot_matches_the_checked_in_golden_value() {
+        let fixture = include_str!("../tests/data/foundation.jsonl");
         let expected: serde_json::Value =
-            serde_json::from_str(include_str!("../../../fixtures/foundation-snapshot.json"))
+            serde_json::from_str(include_str!("../tests/data/foundation-snapshot.json"))
                 .expect("golden snapshot is valid JSON");
         let report = replay(Cursor::new(fixture), Path::new("foundation.jsonl"))
+            .await
             .expect("fixture is readable");
         let actual = serde_json::to_value(report.snapshot()).expect("snapshot serializes");
 
         assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn empty_capture_preserves_unknown_facets() {
-        let report =
-            replay(Cursor::new(""), Path::new("empty.jsonl")).expect("empty source is readable");
+    #[tokio::test]
+    async fn empty_capture_preserves_unknown_facets() {
+        let report = replay(Cursor::new(""), Path::new("empty.jsonl"))
+            .await
+            .expect("empty source is readable");
 
         assert!(report.snapshot().map().context().is_none());
         assert!(report.snapshot().player().location().position().is_none());

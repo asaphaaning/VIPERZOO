@@ -1,15 +1,17 @@
 //! Classify each evidence row before it can enter ordered reduction.
 //!
-//! [`decode`] validates the external representation in stages: JSON shape,
+//! Classification validates the external representation in stages: JSON shape,
 //! row kind, direction, hexadecimal bytes, declared length, then protocol
 //! structure. [`Record::Rejected`] retains the precise boundary failure and
 //! line identity, while only [`Record::Packet`] carries a typed packet onward.
 //! This makes replay diagnostics useful without allowing damaged evidence to
 //! manufacture world facts.
 
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
+use tokio_util::codec::Decoder;
 use tracing::instrument;
-use viperzoo_protocol::{decode as decode_packet, direction::Flow, packet};
+use viperzoo_protocol::{codec::Codec, direction::Flow, packet};
 
 use crate::line::Line;
 
@@ -83,16 +85,15 @@ impl Diagnostic {
     }
 }
 
-/// Classifies one untrusted JSONL line.
-#[must_use]
+/// Classifies one untrusted JSONL row after framing.
 #[instrument(
-    name = "viperzoo::capture::decode_record",
+    name = "viperzoo::capture::classify_record",
     skip(input),
     fields(line = ?line, bytes = input.len()),
     ret(level = "trace")
 )]
-pub fn decode(line: Line, input: &str) -> Record {
-    let row: Row = match serde_json::from_str(input) {
+pub(crate) fn classify(line: Line, input: &[u8]) -> Record {
+    let row: Row = match serde_json::from_slice(input) {
         Ok(row) => row,
         Err(error) => {
             return Record::Rejected(Diagnostic::Json {
@@ -135,8 +136,13 @@ pub fn decode(line: Line, input: &str) -> Record {
         });
     }
 
-    match decode_packet(flow, &body) {
-        Ok(packet) => Record::Packet(packet),
+    let mut source = BytesMut::from(body.as_slice());
+    match Codec::new(flow, body.len()).decode_eof(&mut source) {
+        Ok(Some(packet)) => Record::Packet(packet),
+        Ok(None) => Record::Rejected(Diagnostic::Packet {
+            line,
+            message: "complete capture body remained incomplete".into(),
+        }),
         Err(error) => Record::Rejected(Diagnostic::Packet {
             line,
             message: error.to_string(),
@@ -191,6 +197,10 @@ mod tests {
     use viperzoo_protocol::{packet, server};
 
     use super::*;
+
+    fn decode(line: Line, input: &str) -> Record {
+        classify(line, input.as_bytes())
+    }
 
     #[test]
     fn packet_row_crosses_into_the_typed_protocol() {

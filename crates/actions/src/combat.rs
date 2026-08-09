@@ -9,12 +9,11 @@
 use std::{fmt, time::Duration};
 
 use thiserror::Error;
-use tokio::{sync::watch, time};
 use tracing::instrument;
 use viperzoo_adapter_api::action::{self, Client};
-use viperzoo_engine::Handle;
+use viperzoo_engine::{WaitError, World};
 use viperzoo_protocol::direction::Direction;
-use viperzoo_world::{action as observed, revision::Revision, snapshot::Snapshot};
+use viperzoo_world::{action as observed, query, revision::Revision, snapshot::Snapshot};
 
 /// Timing policy for one face-and-attack transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,25 +93,25 @@ impl fmt::Display for Stage {
 /// Faces `direction`, attacks, and confirms the actual outbound attack body.
 ///
 /// Adapter submission alone is insufficient: the returned [`Report`] proves
-/// the canonical engine observed serverbound `0x13`. `NexusTK` may represent a
+/// the canonical world observed serverbound `0x13`. `NexusTK` may represent a
 /// directional key aimed at a blocking fixture as obstruction rather than a
 /// serverbound `0x11`; that state is recorded as [`Facing::Submitted`] and
 /// must be followed by higher-level target-effect confirmation.
 ///
 /// # Errors
 ///
-/// Returns [`enum@Error`] when the adapter fails, the engine stops, or the
+/// Returns [`enum@Error`] when the adapter fails, the world closes, or the
 /// mandatory plaintext attack body is absent before the configured timeout.
 #[instrument(
     name = "viperzoo::actions::combat::face_and_attack",
-    skip(client, engine),
+    skip(client, world),
     fields(?direction),
     err,
     ret(level = "debug")
 )]
 pub async fn face_and_attack<C>(
     client: &C,
-    engine: &Handle,
+    world: &World,
     direction: Direction,
     config: Config,
 ) -> Result<Report, Error<C::Error>>
@@ -120,9 +119,8 @@ where
     C: Client,
     C::Error: fmt::Debug + fmt::Display,
 {
-    let mut snapshots = engine.subscribe();
-    let before = snapshots.borrow().revision();
-    let facing = if snapshots.borrow().player().facing().value() == Some(&direction) {
+    let before = world.latest().revision();
+    let facing = if world.latest().player().facing().value() == Some(&direction) {
         Facing::Retained
     } else {
         client
@@ -130,7 +128,7 @@ where
             .await
             .map_err(Error::Client)?;
         match wait_for_action(
-            &mut snapshots,
+            world,
             before,
             Stage::Facing,
             config.observation_timeout,
@@ -141,7 +139,7 @@ where
         .await
         {
             Ok(revision) => {
-                if let Some(attack) = find_action(&snapshots.borrow(), before, &|action| {
+                if let Some(attack) = find_action(&world.latest(), before, &|action| {
                     matches!(action, observed::Action::Attack)
                 }) {
                     return Ok(Report {
@@ -152,7 +150,7 @@ where
                 Facing::Observed(revision)
             }
             Err(Error::Unobserved(Stage::Facing)) => {
-                if let Some(attack) = find_action(&snapshots.borrow(), before, &|action| {
+                if let Some(attack) = find_action(&world.latest(), before, &|action| {
                     matches!(action, observed::Action::Attack)
                 }) {
                     return Ok(Report {
@@ -169,13 +167,13 @@ where
     // client's native attack body while it fails to produce `0x11`. Fence the
     // explicit attack after the facing transaction so that incidental action
     // cannot confirm the following intent.
-    let before_attack = snapshots.borrow().revision();
+    let before_attack = world.latest().revision();
     client
         .perform(action::Action::Attack(direction))
         .await
         .map_err(Error::Client)?;
     let attack = wait_for_action(
-        &mut snapshots,
+        world,
         before_attack,
         Stage::Attack,
         config.observation_timeout,
@@ -187,7 +185,7 @@ where
 }
 
 async fn wait_for_action<E>(
-    snapshots: &mut watch::Receiver<std::sync::Arc<Snapshot>>,
+    world: &World,
     after: Revision,
     stage: Stage,
     timeout: Duration,
@@ -196,24 +194,16 @@ async fn wait_for_action<E>(
 where
     E: fmt::Debug + fmt::Display,
 {
-    if let Some(revision) = find_action(&snapshots.borrow(), after, &matches) {
-        return Ok(revision);
-    }
-
-    time::timeout(timeout, async {
-        loop {
-            snapshots
-                .changed()
-                .await
-                .map_err(|_| Error::EngineStopped)?;
-
-            if let Some(revision) = find_action(&snapshots.borrow(), after, &matches) {
-                return Ok(revision);
-            }
-        }
-    })
-    .await
-    .map_err(|_| Error::Unobserved(stage))?
+    world
+        .wait(query::select(move |snapshot| {
+            find_action(snapshot, after, &matches)
+        }))
+        .within(timeout)
+        .await
+        .map_err(|error| match error {
+            WaitError::Closed => Error::WorldStopped,
+            WaitError::Elapsed { .. } => Error::Unobserved(stage),
+        })
 }
 
 fn find_action(
@@ -238,9 +228,9 @@ where
     /// The client action adapter rejected submission.
     #[error("client action failed: {0}")]
     Client(E),
-    /// The canonical engine stopped before observing an action.
-    #[error("canonical engine stopped during combat action confirmation")]
-    EngineStopped,
+    /// The canonical world closed before observing an action.
+    #[error("canonical world closed during combat action confirmation")]
+    WorldStopped,
     /// The adapter returned without the expected outbound plaintext body.
     #[error("submitted {0} action was not observed at the plaintext protocol boundary")]
     Unobserved(Stage),
@@ -248,99 +238,101 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        convert::Infallible,
-        sync::{
-            Arc,
-            atomic::{AtomicU8, Ordering},
-        },
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
     };
 
-    use viperzoo_engine::Config as EngineConfig;
-    use viperzoo_protocol::{decode, direction::Flow};
+    use viperzoo_adapter_api::action::MockClient;
+    use viperzoo_engine::{Config as EngineConfig, Ingress};
+    use viperzoo_protocol::{
+        codec::{Body, Error as CodecError},
+        direction::Flow,
+        packet,
+    };
 
     use super::*;
 
-    #[derive(Clone)]
-    struct ObservingClient {
-        engine: Handle,
+    fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
+        packet::Packet::try_from(Body::new(flow, body))
     }
 
-    #[derive(Clone)]
-    struct AttackOnlyClient {
-        engine: Handle,
+    fn observing_client(ingress: Ingress) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+
+            Box::pin(async move {
+                let body = match action {
+                    action::Action::Face(direction) => vec![0x11, direction.to_wire(), 0x00],
+                    action::Action::Attack(_) => vec![0x13, 0x00, 0x00],
+                    _ => return Ok(()),
+                };
+                let packet = decode(Flow::Serverbound, &body).expect("fixture action decodes");
+                ingress
+                    .observe(packet.into())
+                    .await
+                    .expect("test engine remains available");
+
+                Ok(())
+            })
+        });
+        client
     }
 
-    #[derive(Clone)]
-    struct DirectionalAttackClient {
-        engine: Handle,
-        submissions: Arc<AtomicU8>,
+    fn attack_only_client(ingress: Ingress) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+
+            Box::pin(async move {
+                if matches!(action, action::Action::Attack(_)) {
+                    let packet = decode(Flow::Serverbound, &[0x13, 0x00, 0x00])
+                        .expect("fixture action decodes");
+                    ingress
+                        .observe(packet.into())
+                        .await
+                        .expect("test engine remains available");
+                }
+
+                Ok(())
+            })
+        });
+        client
     }
 
-    impl Client for ObservingClient {
-        type Error = Infallible;
+    fn directional_attack_client(ingress: Ingress, submissions: Arc<AtomicU8>) -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_perform().returning(move |action| {
+            let ingress = ingress.clone();
+            let submissions = Arc::clone(&submissions);
 
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            let body = match action {
-                action::Action::Face(direction) => vec![0x11, direction.to_wire(), 0x00],
-                action::Action::Attack(_) => vec![0x13, 0x00, 0x00],
-                _ => return Ok(()),
-            };
-            let packet = decode(Flow::Serverbound, &body).expect("fixture action decodes");
-            self.engine
-                .observe(packet.into())
-                .await
-                .expect("test engine remains available");
-            Ok(())
-        }
-    }
+            Box::pin(async move {
+                if matches!(action, action::Action::Face(_) | action::Action::Attack(_)) {
+                    let packet = decode(Flow::Serverbound, &[0x13, 0x00, 0x00])
+                        .expect("fixture action decodes");
+                    ingress
+                        .observe(packet.into())
+                        .await
+                        .expect("test engine remains available");
+                    submissions.fetch_add(1, Ordering::Relaxed);
+                }
 
-    impl Client for AttackOnlyClient {
-        type Error = Infallible;
-
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            if !matches!(action, action::Action::Attack(_)) {
-                return Ok(());
-            }
-
-            let packet =
-                decode(Flow::Serverbound, &[0x13, 0x00, 0x00]).expect("fixture action decodes");
-            self.engine
-                .observe(packet.into())
-                .await
-                .expect("test engine remains available");
-            Ok(())
-        }
-    }
-
-    impl Client for DirectionalAttackClient {
-        type Error = Infallible;
-
-        async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-            if !matches!(action, action::Action::Face(_) | action::Action::Attack(_)) {
-                return Ok(());
-            }
-
-            let packet =
-                decode(Flow::Serverbound, &[0x13, 0x00, 0x00]).expect("fixture action decodes");
-            self.engine
-                .observe(packet.into())
-                .await
-                .expect("test engine remains available");
-            self.submissions.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
+                Ok(())
+            })
+        });
+        client
     }
 
     #[tokio::test]
     async fn report_requires_observed_facing_then_attack() {
-        let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
-        let owner = tokio::spawn(task.run());
-        let client = ObservingClient {
-            engine: engine.clone(),
-        };
+        let channel = viperzoo_engine::channel(EngineConfig::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+        let client = observing_client(ingress.clone());
 
-        let report = face_and_attack(&client, &engine, Direction::Right, Config::default())
+        let report = face_and_attack(&client, &world, Direction::Right, Config::default())
             .await
             .expect("both submitted bodies are observed");
 
@@ -349,73 +341,77 @@ mod tests {
         };
         assert!(facing < report.attack());
         assert_eq!(
-            engine.snapshot().player().facing().value(),
+            world.latest().player().facing().value(),
             Some(&Direction::Right)
         );
 
-        engine.shutdown().await.expect("engine shuts down");
+        drop(client);
+        drop(ingress);
         owner.await.expect("engine owner joins");
     }
 
     #[tokio::test]
     async fn retained_facing_avoids_a_redundant_packet() {
-        let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
-        let owner = tokio::spawn(task.run());
-        let client = ObservingClient {
-            engine: engine.clone(),
-        };
+        let channel = viperzoo_engine::channel(EngineConfig::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+        let client = observing_client(ingress.clone());
 
-        face_and_attack(&client, &engine, Direction::Right, Config::default())
+        face_and_attack(&client, &world, Direction::Right, Config::default())
             .await
             .expect("initial transaction establishes facing");
-        let before = engine.snapshot().revision();
-        let report = face_and_attack(&client, &engine, Direction::Right, Config::default())
+        let before = world.latest().revision();
+        let report = face_and_attack(&client, &world, Direction::Right, Config::default())
             .await
             .expect("retained facing permits attack");
 
         assert_eq!(report.facing(), Facing::Retained);
         assert_eq!(report.attack().value(), before.value() + 1);
 
-        engine.shutdown().await.expect("engine shuts down");
+        drop(client);
+        drop(ingress);
         owner.await.expect("engine owner joins");
     }
 
     #[tokio::test]
     async fn obstruction_style_native_facing_can_be_proven_by_following_attack() {
-        let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
-        let owner = tokio::spawn(task.run());
-        let client = AttackOnlyClient {
-            engine: engine.clone(),
-        };
+        let channel = viperzoo_engine::channel(EngineConfig::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+        let client = attack_only_client(ingress.clone());
 
-        let report = face_and_attack(&client, &engine, Direction::Up, Config::new(Duration::ZERO))
+        let report = face_and_attack(&client, &world, Direction::Up, Config::new(Duration::ZERO))
             .await
             .expect("an observed native attack completes the transaction");
 
         assert_eq!(report.facing(), Facing::Submitted);
 
-        engine.shutdown().await.expect("engine shuts down");
+        drop(client);
+        drop(ingress);
         owner.await.expect("engine owner joins");
     }
 
     #[tokio::test]
     async fn directional_wake_attack_fulfills_the_single_swing_intent() {
-        let (engine, task) = viperzoo_engine::channel(EngineConfig::default());
-        let owner = tokio::spawn(task.run());
-        let client = DirectionalAttackClient {
-            engine: engine.clone(),
-            submissions: Arc::new(AtomicU8::new(0)),
-        };
+        let channel = viperzoo_engine::channel(EngineConfig::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+        let submissions = Arc::new(AtomicU8::new(0));
+        let client = directional_attack_client(ingress.clone(), Arc::clone(&submissions));
 
-        let report = face_and_attack(&client, &engine, Direction::Up, Config::new(Duration::ZERO))
+        let report = face_and_attack(&client, &world, Direction::Up, Config::new(Duration::ZERO))
             .await
             .expect("the native directional attack fulfills the transaction");
 
         assert_eq!(report.facing(), Facing::Submitted);
         assert_eq!(report.attack().value(), 1);
-        assert_eq!(client.submissions.load(Ordering::Relaxed), 1);
+        assert_eq!(submissions.load(Ordering::Relaxed), 1);
 
-        engine.shutdown().await.expect("engine shuts down");
+        drop(client);
+        drop(ingress);
         owner.await.expect("engine owner joins");
     }
 }

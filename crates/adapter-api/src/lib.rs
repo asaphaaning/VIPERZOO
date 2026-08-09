@@ -8,8 +8,13 @@
 //! The vocabulary is intentionally closed: it makes session starts, socket
 //! closes, packets, and validated memory snapshots explicit rather than
 //! allowing individual adapters to smuggle their own state into the world.
+//!
+//! Enable the `test-util` feature to generate Mockall doubles for the focused
+//! [`action::Client`], [`observation::Sink`], and [`runtime::Driver`]
+//! capabilities.
 
 pub mod action;
 pub mod inventory;
 pub mod observation;
 pub mod resource;
+pub mod runtime;

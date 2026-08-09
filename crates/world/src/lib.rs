@@ -21,6 +21,7 @@ pub mod inventory;
 pub mod knowledge;
 pub mod map;
 pub mod player;
+pub mod query;
 pub mod revision;
 pub mod session;
 pub mod snapshot;

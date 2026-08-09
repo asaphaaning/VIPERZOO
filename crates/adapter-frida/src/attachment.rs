@@ -2,7 +2,7 @@
 //!
 //! This is the audited FFI boundary of the workspace. Frida Core values and
 //! client process interaction remain here because they are non-`Send` and
-//! require narrow unsafe calls. [`Control`] and [`Attachment`] turn that
+//! require narrow unsafe calls. [`Control`] and [`Driver`] turn that
 //! thread-bound runtime into an asynchronous Rust-facing interface without
 //! making the engine, scripts, or policy layer depend on Frida types.
 //!
@@ -18,27 +18,32 @@ use std::{
     collections::BTreeSet,
     fs, io,
     path::PathBuf,
+    pin::Pin,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    task::{Context, Poll},
     thread,
     time::{Duration, Instant},
 };
 
 use frida::{Device, DeviceManager, Frida, ScriptOption};
+use futures_core::Stream;
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc as async_mpsc, oneshot};
 use tracing::{debug, info, instrument, warn};
 use viperzoo_adapter_api::{
     action,
     inventory::{self, Item, Snapshot as InventorySnapshot},
-    observation::Observation,
+    observation::{self, Observation},
     resource::{self, Pool, Resources},
+    runtime,
 };
-use viperzoo_engine::Handle;
 use viperzoo_protocol::{map as protocol, primitive::MapId};
+#[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM},
     UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible},
 };
+#[cfg(windows)]
 use windows_sys::core::BOOL;
 
 use crate::{
@@ -71,13 +76,66 @@ const INVENTORY_SEED_RETRY: Duration = Duration::from_millis(200);
 /// ordinary slow boundaries alone.
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// A live direct Frida attachment.
+/// Configured direct Frida acquisition.
+#[derive(Clone, Debug)]
+pub struct Adapter {
+    config: Config,
+}
+
+impl Adapter {
+    /// Creates a direct adapter for the configured NexusTK target.
+    #[must_use]
+    pub const fn new(config: Config) -> Self {
+        Self { config }
+    }
+}
+
+impl runtime::Adapter for Adapter {
+    type Client = Control;
+    type Driver = Driver;
+    type Error = Error;
+    type Event = Event;
+    type Events = Events;
+
+    async fn start<S>(self, sink: S) -> Result<Running, Self::Error>
+    where
+        S: observation::Sink + Clone,
+    {
+        attach(self.config, sink)
+    }
+}
+
+/// Capabilities of a running direct Frida adapter.
+pub type Running = runtime::Running<Control, Events, Driver>;
+
+/// Single owner of a live direct Frida attachment.
 #[derive(Debug)]
-#[must_use = "dropping the attachment requests shutdown; call wait to observe the result"]
-pub struct Attachment {
+#[must_use = "dropping the driver requests shutdown; call wait or shutdown to observe the result"]
+pub struct Driver {
     commands: Sender<Command>,
-    events: Receiver<Event>,
     thread: Option<thread::JoinHandle<Result<(), Error>>>,
+}
+
+/// Asynchronous lifecycle and diagnostic events from direct acquisition.
+#[derive(Debug)]
+pub struct Events {
+    receiver: async_mpsc::UnboundedReceiver<Event>,
+}
+
+impl Events {
+    /// Removes the next event that is immediately available.
+    #[must_use]
+    pub fn next_ready(&mut self) -> Option<Event> {
+        self.receiver.try_recv().ok()
+    }
+}
+
+impl Stream for Events {
+    type Item = Event;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(context)
+    }
 }
 
 /// Cloneable asynchronous control surface for the dedicated Frida owner.
@@ -142,21 +200,7 @@ impl ActionReceipt {
     }
 }
 
-impl Attachment {
-    /// Returns a cloneable asynchronous client-action handle.
-    #[must_use]
-    pub fn control(&self) -> Control {
-        Control {
-            commands: self.commands.clone(),
-        }
-    }
-
-    /// Returns pending lifecycle and diagnostic events.
-    #[must_use]
-    pub const fn events(&self) -> &Receiver<Event> {
-        &self.events
-    }
-
+impl Driver {
     /// Returns whether the dedicated Frida thread has stopped.
     #[must_use]
     pub fn is_finished(&self) -> bool {
@@ -177,7 +221,7 @@ impl Attachment {
         err,
         ret(level = "debug")
     )]
-    pub async fn stop(mut self) -> Result<(), Error> {
+    pub async fn shutdown(mut self) -> Result<(), Error> {
         let _ = self.commands.send(Command::Shutdown);
         self.join().await
     }
@@ -208,7 +252,23 @@ impl Attachment {
     }
 }
 
-impl Drop for Attachment {
+impl runtime::Driver for Driver {
+    type Error = Error;
+
+    fn is_finished(&self) -> bool {
+        Driver::is_finished(self)
+    }
+
+    async fn wait(self) -> Result<(), Self::Error> {
+        Driver::wait(self).await
+    }
+
+    async fn shutdown(self) -> Result<(), Self::Error> {
+        Driver::shutdown(self).await
+    }
+}
+
+impl Drop for Driver {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
     }
@@ -219,44 +279,57 @@ impl Drop for Attachment {
 /// # Errors
 ///
 /// Returns [`Error::ThreadStart`] when the dedicated owner thread cannot be
-/// created. Attachment lifecycle failures are returned by [`Attachment::wait`]
-/// or [`Attachment::stop`].
+/// created. Lifecycle failures are returned by [`Driver::wait`] or
+/// [`Driver::shutdown`].
 #[instrument(
     name = "viperzoo::adapter::frida::attach",
-    skip(engine),
+    skip(ingress),
     fields(target = ?config.target()),
     err,
     ret(level = "debug")
 )]
-pub fn attach(config: Config, engine: Handle) -> Result<Attachment, Error> {
+pub fn attach<S>(config: Config, ingress: S) -> Result<Running, Error>
+where
+    S: observation::Sink + Clone,
+{
     let (commands, command_receiver) = mpsc::channel();
-    let (events, event_receiver) = mpsc::channel();
+    let (events, event_receiver) = async_mpsc::unbounded_channel();
     // Frida's session graph is non-Send. One long-lived OS thread is the
     // ownership boundary; Tokio remains responsible for every consumer-facing
     // wait, controller, timer, and application task outside this island.
     let thread = thread::Builder::new()
         .name("viperzoo-frida".into())
-        .spawn(move || run(config, engine, command_receiver, events))
+        .spawn(move || run(config, ingress, command_receiver, events))
         .map_err(Error::ThreadStart)?;
 
-    Ok(Attachment {
+    let client = Control {
+        commands: commands.clone(),
+    };
+    let events = Events {
+        receiver: event_receiver,
+    };
+    let driver = Driver {
         commands,
-        events: event_receiver,
         thread: Some(thread),
-    })
+    };
+
+    Ok(Running::new(client, events, driver))
 }
 
 #[instrument(
     name = "viperzoo::adapter::frida::run",
-    skip(config, engine, commands, events),
+    skip(config, ingress, commands, events),
     err
 )]
-fn run(
+fn run<S>(
     config: Config,
-    engine: Handle,
+    ingress: S,
     commands: Receiver<Command>,
-    events: Sender<Event>,
-) -> Result<(), Error> {
+    events: async_mpsc::UnboundedSender<Event>,
+) -> Result<(), Error>
+where
+    S: observation::Sink + Clone,
+{
     // SAFETY: This dedicated thread is the sole owner of the Frida runtime,
     // and every borrowed manager, device, session, and script is dropped
     // before the runtime leaves this scope.
@@ -277,18 +350,18 @@ fn run(
     let mut script = session.create_script(&source, &mut options)?;
 
     script.handle_message(Handler::new(
-        engine.clone(),
+        ingress.clone(),
         events.clone(),
         info.clone(),
         recorder,
     ))?;
-    engine.observe_blocking(Observation::SessionStarted)?;
+    ingress.observe_blocking(Observation::SessionStarted)?;
     script.load()?;
 
     match script.exports.call("clientResources", None)? {
         Some(value) => match resource_snapshot(value) {
             Ok(Some(resources)) => {
-                engine.observe_blocking(Observation::PlayerResources(resources))?;
+                ingress.observe_blocking(Observation::PlayerResources(resources))?;
                 let _ = events.send(Event::ResourcesSeeded(resources));
             }
             Ok(None) => {}
@@ -303,8 +376,8 @@ fn run(
         }
     }
 
-    seed_inventory(&mut script, &engine, &events)?;
-    seed_map_identity(&mut script, &engine, &events)?;
+    seed_inventory(&mut script, &ingress, &events)?;
+    seed_map_identity(&mut script, &ingress, &events)?;
 
     let _ = events.send(Event::Attached(info));
 
@@ -333,11 +406,14 @@ fn run(
     Ok(())
 }
 
-fn seed_inventory(
+fn seed_inventory<S>(
     script: &mut frida::Script<'_>,
-    engine: &Handle,
-    events: &Sender<Event>,
-) -> Result<(), Error> {
+    ingress: &S,
+    events: &async_mpsc::UnboundedSender<Event>,
+) -> Result<(), Error>
+where
+    S: observation::Sink,
+{
     for attempt in 1..=INVENTORY_SEED_ATTEMPTS {
         let result = script.exports.call("clientInventory", None)?;
 
@@ -346,7 +422,7 @@ fn seed_inventory(
                 let capacity = inventory.capacity();
                 let occupied = inventory.items().len();
 
-                engine.observe_blocking(Observation::PlayerInventory(inventory))?;
+                ingress.observe_blocking(Observation::PlayerInventory(inventory))?;
                 let _ = events.send(Event::InventorySeeded { capacity, occupied });
                 return Ok(());
             }
@@ -545,6 +621,7 @@ fn resolve(device: &Device<'_>, target: &Target) -> Result<u32, Error> {
     }
 }
 
+#[cfg(windows)]
 fn visible_processes() -> BTreeSet<u32> {
     let mut pids = BTreeSet::new();
 
@@ -559,6 +636,12 @@ fn visible_processes() -> BTreeSet<u32> {
     pids
 }
 
+#[cfg(not(windows))]
+fn visible_processes() -> BTreeSet<u32> {
+    BTreeSet::new()
+}
+
+#[cfg(windows)]
 unsafe extern "system" fn record_visible_process(window: HWND, state: LPARAM) -> BOOL {
     // SAFETY: The callback is invoked only by `visible_processes`, which passes
     // a live `BTreeSet<u32>` pointer for the entire synchronous enumeration.
@@ -602,11 +685,14 @@ fn agent_config() -> serde_json::Value {
 /// identity is reported with its dimensions because the client stores and
 /// re-validates the three together, which is what makes the reading checkable
 /// rather than a bare number that any two bytes could imitate.
-fn seed_map_identity(
+fn seed_map_identity<S>(
     script: &mut frida::Script<'_>,
-    engine: &Handle,
-    events: &Sender<Event>,
-) -> Result<(), Error> {
+    ingress: &S,
+    events: &async_mpsc::UnboundedSender<Event>,
+) -> Result<(), Error>
+where
+    S: observation::Sink,
+{
     let reply = script
         .exports
         .call("clientMapContext", None)
@@ -643,7 +729,7 @@ fn seed_map_identity(
                 title = ?title,
                 "map identity seeded from client memory"
             );
-            engine.observe_blocking(Observation::ClientMap {
+            ingress.observe_blocking(Observation::ClientMap {
                 identity,
                 title: title.map(|title| title.to_string()),
             })?;
@@ -885,9 +971,9 @@ pub enum Error {
     /// The official Frida binding rejected a lifecycle operation.
     #[error(transparent)]
     Frida(#[from] frida::Error),
-    /// The canonical engine stopped while the adapter was attached.
+    /// Canonical observation ingress stopped while the adapter was attached.
     #[error(transparent)]
-    Engine(#[from] viperzoo_engine::Error),
+    Ingress(#[from] observation::Error),
 }
 
 #[cfg(test)]

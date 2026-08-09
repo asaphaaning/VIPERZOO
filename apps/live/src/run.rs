@@ -2,19 +2,22 @@
 
 use std::{io::SeekFrom, path::PathBuf, time::Duration};
 
+use bytes::BytesMut;
 use thiserror::Error;
 use tokio::{
     fs::File,
-    io::{AsyncBufReadExt, AsyncSeekExt, BufReader, BufWriter},
+    io::{AsyncReadExt, AsyncSeekExt, BufWriter},
     time,
 };
+use tokio_util::codec::Decoder;
 use tracing::{debug, instrument};
 use viperzoo_adapter_api::observation::Observation;
 use viperzoo_capture::{
+    codec::{self, Codec},
     line::Line,
-    record::{self, Record},
+    record::Record,
 };
-use viperzoo_engine::{self, Handle};
+use viperzoo_engine::{self, Ingress, World};
 use viperzoo_world::world::Change;
 
 use crate::{
@@ -39,7 +42,7 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
             path: config.capture().to_owned(),
             source,
         })?;
-    let mut reader = BufReader::new(file);
+    let mut reader = file;
 
     if config.start() == Start::End {
         reader
@@ -52,26 +55,28 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
     }
 
     let mut output = BufWriter::new(tokio::io::stdout());
-    let (engine, owner) = viperzoo_engine::channel(viperzoo_engine::Config::default());
-    let _owner = tokio::spawn(owner.run());
+    let channel = viperzoo_engine::channel(viperzoo_engine::Config::default());
+    let ingress = channel.ingress();
+    let world = channel.world();
+    let _owner = tokio::spawn(channel.owner().run());
     let mut phase = Phase::CatchingUp;
-    let mut pending = String::new();
-    let mut line = Line::FIRST;
+    let mut pending = BytesMut::new();
+    let mut codec = Codec::new();
 
     loop {
         let bytes_read = reader
-            .read_line(&mut pending)
+            .read_buf(&mut pending)
             .await
             .map_err(|source| Error::Read {
                 path: config.capture().to_owned(),
-                line,
+                line: codec.next_line(),
                 source,
             })?;
 
         if bytes_read == 0 {
             if pending.is_empty() && phase == Phase::CatchingUp {
                 phase = Phase::Following;
-                let snapshot = engine.snapshot();
+                let snapshot = world.latest();
                 publish_ready(&mut output, config.output(), &snapshot).await?;
                 tracing::info!(
                     revision = snapshot.revision().value(),
@@ -83,28 +88,23 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
             continue;
         }
 
-        if !pending.ends_with('\n') {
-            continue;
+        while let Some(record) = codec.decode(&mut pending)? {
+            publish_record(
+                &mut output,
+                config.output(),
+                &ingress,
+                &world,
+                phase,
+                record,
+            )
+            .await?;
         }
-
-        let input = pending.trim_end_matches(['\r', '\n']);
-        publish_record(
-            &mut output,
-            config.output(),
-            &engine,
-            phase,
-            record::decode(line, input),
-        )
-        .await?;
-
-        pending.clear();
-        line = line.next().ok_or(Error::LineCapacity)?;
     }
 }
 
 #[instrument(
     name = "viperzoo::live::publish_record",
-    skip(output, engine, record),
+    skip(output, ingress, world, record),
     fields(phase = ?phase, detail = ?detail),
     err,
     ret(level = "debug")
@@ -112,7 +112,8 @@ pub async fn follow(config: &Config) -> Result<(), Error> {
 async fn publish_record(
     output: &mut BufWriter<tokio::io::Stdout>,
     detail: Output,
-    engine: &Handle,
+    ingress: &Ingress,
+    world: &World,
     phase: Phase,
     record: Record,
 ) -> Result<(), Error> {
@@ -134,11 +135,11 @@ async fn publish_record(
         }
         Record::Skipped => return Ok(()),
     };
-    let change = engine.observe(observation).await?.change();
+    let change = ingress.observe(observation).await?.change();
 
     match (phase, change) {
         (Phase::Following, Change::Projected(revision)) => {
-            let snapshot = engine.snapshot();
+            let snapshot = world.latest();
 
             match detail {
                 Output::Summary => {
@@ -228,17 +229,17 @@ pub enum Error {
         /// Capture path.
         path: PathBuf,
         /// One-based line since the selected attachment position.
-        line: Line,
+        line: Option<Line>,
         /// Filesystem failure.
         source: std::io::Error,
     },
-    /// The stream exceeded the complete `u64` line identity space.
-    #[error("live capture exceeds the supported line identity space")]
-    LineCapacity,
+    /// Capture row framing failed.
+    #[error(transparent)]
+    Capture(#[from] codec::Error),
     /// A typed engine event could not be published.
     #[error(transparent)]
     Message(#[from] message::Error),
-    /// The canonical projection owner stopped unexpectedly.
+    /// Canonical observation ingress stopped unexpectedly.
     #[error(transparent)]
-    Engine(#[from] viperzoo_engine::Error),
+    Ingress(#[from] viperzoo_engine::Error),
 }

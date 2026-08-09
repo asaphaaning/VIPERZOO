@@ -964,6 +964,51 @@ function requestNetworkPoll() {
   // accepted input with no gameplay command: unlike WM_NULL, it advances the
   // client's input loop without changing map state or pretending to be
   // liveness maintenance.
+  //
+  // KNOWN DEFECT — a modal dialog defeats this wake.
+  //
+  // While a dialog is open the tap stops reaching the network poll, so the
+  // queued body stays ready and undrained until `DISPATCH_TIMEOUT` reports a
+  // stuck queue.
+  //
+  // There is only one window and one message pump: NexusTK draws its dialogs
+  // inside the game canvas rather than as Win32 dialogs. Do not look for a
+  // second HWND to post to — there is none. What the evidence supports is that
+  // input is *routed to the dialog* while it is open, and a Control tap means
+  // nothing to a dialog, so it is consumed without advancing the poll the drain
+  // depends on.
+  //
+  // Measured in run 43 (`captures/run-43-20260807-212358`). The Yellow scroll
+  // purchase was enqueued at 20:47:30.926 and failed at 20:49:30.932 — 120.006
+  // seconds, exactly the dispatch bound. Across that window the client sent six
+  // packets in total (`0x45` x4, `0x75` x2, all keepalive) while still
+  // receiving normally (33 x `0x11`), so the network thread was alive and only
+  // the drain was starved:
+  //
+  //   20:46   outgoing 171     20:48   outgoing 3
+  //   20:47   outgoing  88     20:49   outgoing 3
+  //
+  // It is intermittent for the same reason: a body enqueued while the client is
+  // still emitting drains on the poll already in flight, and one enqueued after
+  // the dialog settles deadlocks. The same run completed this transaction twice
+  // before failing on the third.
+  //
+  // Draining from the incoming plaintext hook is *not* an alternative: that
+  // boundary must never re-enter the outgoing cipher, and `agent::tests`
+  // asserts it does not.
+  //
+  // The intended remedy is recovery rather than a better wake. A dialog does
+  // respond to input — that is what it is for — so a key it understands should
+  // reach it where a Control tap does not. Sending Escape closes the dialog,
+  // which returns the client to its ordinary input path and lets the poll
+  // resume. That abandons the transaction rather than completing it, so the
+  // caller must re-read state instead of assuming nothing happened: run 43's
+  // deposit had already succeeded and only the scroll purchase stalled, so a
+  // retry that replays the whole batch would deposit wood the player no longer
+  // holds.
+  //
+  // One run settles whether Escape is honoured here, and `clientKeyInfo`
+  // already carries the vk/scan machinery it would use.
   const post = postMessage();
   const hwnd = resolveClientWindow();
   const scan = 0x1d;

@@ -1,9 +1,13 @@
 //! Provide the stable vocabulary for writing VIPERZOO scripts.
 //!
 //! This crate re-exports the domain, planning, policy, and engine crates under
-//! one dependency. It intentionally does not re-export a live acquisition
-//! adapter: scripts may depend on [`engine`] and [`actions`] without becoming
-//! coupled to Frida, replay, or a future transport implementation.
+//! one dependency. [`Session`] composes any typed adapter with a canonical
+//! engine while leaving the concrete acquisition implementation in the
+//! application dependency graph.
+
+mod session;
+
+pub use session::{Builder, Error, Owner, Session};
 
 pub use viperzoo_actions as actions;
 pub use viperzoo_adapter_api as adapter;

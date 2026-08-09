@@ -1,9 +1,9 @@
 //! Persist optional evidence without making recording part of live delivery.
 //!
-//! The direct adapter sends observations to the engine first as its operational
-//! responsibility. This module independently appends compatible evidence rows
-//! for later analysis. A write failure changes the recorder to [`Recorder::Failed`]
-//! so repeated callback handling does not repeatedly attempt a broken sink.
+//! The direct adapter records raw callback evidence before attempting protocol
+//! promotion, so rejected bodies remain available for later analysis. Recording
+//! stays independent of live delivery: a write failure changes the recorder to
+//! [`Recorder::Failed`] without stopping the engine observation path.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -12,7 +12,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use bytes::BytesMut;
+use tokio_util::codec::Encoder;
+use viperzoo_capture::{
+    codec::Codec,
+    frame::{Frame, Operation},
+};
 use viperzoo_protocol::direction::Flow;
 
 use crate::config::Recording;
@@ -20,8 +25,15 @@ use crate::config::Recording;
 #[derive(Debug)]
 pub(crate) enum Recorder {
     Disabled,
-    Active(BufWriter<File>),
+    Active(Box<Active>),
     Failed,
+}
+
+#[derive(Debug)]
+pub(crate) struct Active {
+    writer: BufWriter<File>,
+    codec: Codec,
+    buffer: BytesMut,
 }
 
 impl Recorder {
@@ -37,17 +49,19 @@ impl Recorder {
             fs::create_dir_all(parent)?;
         }
 
-        let mut writer = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
+        let writer = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
+        let mut active = Active {
+            writer,
+            codec: Codec::new(),
+            buffer: BytesMut::new(),
+        };
 
-        write_row(
-            &mut writer,
-            &Row::CaptureSessionStart {
-                target_pid: pid,
-                captured_unix_ms: captured_unix_ms(),
-            },
-        )?;
+        active.write(Frame::SessionStarted {
+            target_pid: pid,
+            captured_unix_ms: captured_unix_ms(),
+        })?;
 
-        Ok(Self::Active(writer))
+        Ok(Self::Active(Box::new(active)))
     }
 
     pub(crate) fn packet(
@@ -56,22 +70,17 @@ impl Recorder {
         body: &[u8],
         thread_id: Option<u32>,
     ) -> Result<(), io::Error> {
-        let Self::Active(writer) = self else {
+        let Self::Active(active) = self else {
             return Ok(());
         };
-        let direction = match flow {
-            Flow::Clientbound => "incoming",
-            Flow::Serverbound => "outgoing",
-        };
-        let row = Row::Packet {
-            direction,
-            length: body.len(),
-            hex: hex::encode(body),
+        let frame = Frame::Packet {
+            flow,
+            body,
             thread_id,
             captured_unix_ms: captured_unix_ms(),
         };
 
-        if let Err(error) = write_row(writer, &row) {
+        if let Err(error) = active.write(frame) {
             *self = Self::Failed;
             return Err(error);
         }
@@ -80,15 +89,15 @@ impl Recorder {
     }
 
     pub(crate) fn transport_closed(&mut self, source: &str) -> Result<(), io::Error> {
-        let Self::Active(writer) = self else {
+        let Self::Active(active) = self else {
             return Ok(());
         };
-        let row = Row::TransportClosed {
+        let frame = Frame::TransportClosed {
             source,
             captured_unix_ms: captured_unix_ms(),
         };
 
-        if let Err(error) = write_row(writer, &row) {
+        if let Err(error) = active.write(frame) {
             *self = Self::Failed;
             return Err(error);
         }
@@ -96,20 +105,37 @@ impl Recorder {
         Ok(())
     }
 
-    pub(crate) fn transport_fault(&mut self, operation: &str, code: i32) -> Result<(), io::Error> {
-        let Self::Active(writer) = self else {
+    pub(crate) fn transport_fault(
+        &mut self,
+        operation: Operation,
+        code: i32,
+    ) -> Result<(), io::Error> {
+        let Self::Active(active) = self else {
             return Ok(());
         };
-        let row = Row::TransportFault {
+        let frame = Frame::TransportFault {
             operation,
             code,
             captured_unix_ms: captured_unix_ms(),
         };
 
-        if let Err(error) = write_row(writer, &row) {
+        if let Err(error) = active.write(frame) {
             *self = Self::Failed;
             return Err(error);
         }
+
+        Ok(())
+    }
+}
+
+impl Active {
+    fn write(&mut self, frame: Frame<'_>) -> Result<(), io::Error> {
+        self.codec
+            .encode(frame, &mut self.buffer)
+            .map_err(io::Error::other)?;
+        self.writer.write_all(&self.buffer)?;
+        self.writer.flush()?;
+        self.buffer.clear();
 
         Ok(())
     }
@@ -122,43 +148,11 @@ pub(crate) fn path(recording: &Recording) -> Option<&Path> {
     }
 }
 
-fn write_row(writer: &mut impl Write, row: &Row<'_>) -> Result<(), io::Error> {
-    serde_json::to_writer(&mut *writer, row).map_err(io::Error::other)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
-}
-
 fn captured_unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-enum Row<'a> {
-    CaptureSessionStart {
-        target_pid: u32,
-        captured_unix_ms: u128,
-    },
-    Packet {
-        direction: &'a str,
-        length: usize,
-        hex: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        thread_id: Option<u32>,
-        captured_unix_ms: u128,
-    },
-    TransportClosed {
-        source: &'a str,
-        captured_unix_ms: u128,
-    },
-    TransportFault {
-        operation: &'a str,
-        code: i32,
-        captured_unix_ms: u128,
-    },
 }
 
 #[cfg(test)]
@@ -167,37 +161,41 @@ mod tests {
 
     #[test]
     fn rows_match_the_existing_capture_boundary() {
-        let mut output = Vec::new();
+        let mut output = BytesMut::new();
 
-        write_row(
-            &mut output,
-            &Row::CaptureSessionStart {
-                target_pid: 1234,
-                captured_unix_ms: 1,
-            },
-        )
-        .expect("memory writer accepts session row");
-        write_row(
-            &mut output,
-            &Row::Packet {
-                direction: "incoming",
-                length: 3,
-                hex: "130000".into(),
-                thread_id: Some(44),
-                captured_unix_ms: 2,
-            },
-        )
-        .expect("memory writer accepts packet row");
-        write_row(
-            &mut output,
-            &Row::TransportClosed {
-                source: "recv-zero",
-                captured_unix_ms: 3,
-            },
-        )
-        .expect("memory writer accepts transport close row");
+        let mut codec = Codec::new();
 
-        let rows = String::from_utf8(output).expect("JSONL is UTF-8");
+        codec
+            .encode(
+                Frame::SessionStarted {
+                    target_pid: 1234,
+                    captured_unix_ms: 1,
+                },
+                &mut output,
+            )
+            .expect("memory writer accepts session row");
+        codec
+            .encode(
+                Frame::Packet {
+                    flow: Flow::Clientbound,
+                    body: &[0x13, 0x00, 0x00],
+                    thread_id: Some(44),
+                    captured_unix_ms: 2,
+                },
+                &mut output,
+            )
+            .expect("memory writer accepts packet row");
+        codec
+            .encode(
+                Frame::TransportClosed {
+                    source: "recv-zero",
+                    captured_unix_ms: 3,
+                },
+                &mut output,
+            )
+            .expect("memory writer accepts transport close row");
+
+        let rows = String::from_utf8(output.to_vec()).expect("JSONL is UTF-8");
         let mut rows = rows.lines();
         let session: serde_json::Value =
             serde_json::from_str(rows.next().expect("session row exists")).expect("valid JSON");
