@@ -38,10 +38,12 @@ use viperzoo_adapter_api::{
     runtime,
 };
 use viperzoo_protocol::{map as protocol, primitive::MapId};
+#[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM},
     UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible},
 };
+#[cfg(windows)]
 use windows_sys::core::BOOL;
 
 use crate::{
@@ -619,6 +621,7 @@ fn resolve(device: &Device<'_>, target: &Target) -> Result<u32, Error> {
     }
 }
 
+#[cfg(windows)]
 fn visible_processes() -> BTreeSet<u32> {
     let mut pids = BTreeSet::new();
 
@@ -633,6 +636,12 @@ fn visible_processes() -> BTreeSet<u32> {
     pids
 }
 
+#[cfg(not(windows))]
+fn visible_processes() -> BTreeSet<u32> {
+    BTreeSet::new()
+}
+
+#[cfg(windows)]
 unsafe extern "system" fn record_visible_process(window: HWND, state: LPARAM) -> BOOL {
     // SAFETY: The callback is invoked only by `visible_processes`, which passes
     // a live `BTreeSet<u32>` pointer for the entire synchronous enumeration.
