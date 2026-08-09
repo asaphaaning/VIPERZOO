@@ -1,13 +1,17 @@
 //! Provide the stable vocabulary for writing VIPERZOO scripts.
 //!
 //! This crate re-exports the domain, planning, policy, and engine crates under
-//! one dependency. [`Session`] composes any typed adapter with a canonical
+//! one dependency. [`session`] composes any typed adapter with a canonical
 //! engine while leaving the concrete acquisition implementation in the
-//! application dependency graph.
+//! application dependency graph. Its fluent builder either returns the
+//! adapter's typed event stream or owns an exhaustive event handler as part of
+//! the session lifecycle.
 
 mod session;
 
-pub use session::{Builder, Error, Owner, Session};
+pub use session::{
+    Builder, Error, EventError, HandledBuilder, HandledSession, Owner, Session, session,
+};
 
 pub use viperzoo_actions as actions;
 pub use viperzoo_adapter_api as adapter;

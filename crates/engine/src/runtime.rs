@@ -5,6 +5,9 @@
 //! immutable snapshots, and one [`Owner`] reduces every accepted observation.
 //! The types make observation authority, knowledge access, and runtime
 //! ownership distinct instead of granting all three to every caller.
+//! [`Channel::spawn`] schedules that owner explicitly and returns [`Running`],
+//! which preserves the same capability split without exposing an executor
+//! task handle.
 //!
 //! Backpressure is intentional: an acquisition boundary must slow down rather
 //! than let an unbounded queue hide lost responsiveness or memory growth.
@@ -12,7 +15,11 @@
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+};
 use tracing::{debug, instrument};
 use viperzoo_adapter_api::observation::{self, Observation};
 use viperzoo_world::{
@@ -65,22 +72,24 @@ impl Receipt {
     }
 }
 
-/// The connected capabilities of one live engine.
+/// The connected capabilities of one unstarted engine.
 ///
 /// Clone the capabilities needed by each participant before consuming the
 /// channel with [`Channel::owner`]:
 ///
 /// ```no_run
-/// # async fn run() {
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// let channel = viperzoo_engine::channel(viperzoo_engine::Config::default());
-/// let ingress = channel.ingress();
-/// let world = channel.world();
-/// let owner = tokio::spawn(channel.owner().run());
+/// let running = channel.spawn()?;
+/// let ingress = running.ingress();
+/// let world = running.world();
+/// let task = running.owner();
 ///
 /// drop(ingress);
-/// owner.await.expect("engine owner does not panic");
+/// task.wait().await?;
 ///
 /// let _snapshot = world.latest();
+/// # Ok(())
 /// # }
 /// ```
 #[derive(Debug)]
@@ -107,6 +116,90 @@ impl Channel {
     /// Consumes the channel and returns its single runtime owner.
     pub fn owner(self) -> Owner {
         self.owner
+    }
+
+    /// Schedules the engine owner on the current Tokio runtime.
+    ///
+    /// This is the opinionated counterpart to [`Channel::owner`]. The
+    /// returned [`Running`] keeps executor ownership typed while preserving
+    /// independent ingress and world capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] when called outside an active Tokio runtime.
+    #[instrument(name = "viperzoo::engine::spawn", skip(self), err)]
+    pub fn spawn(self) -> Result<Running, SpawnError> {
+        let runtime = Handle::try_current().map_err(SpawnError::Runtime)?;
+        let Self {
+            ingress,
+            world,
+            owner,
+        } = self;
+        let task = Task {
+            handle: runtime.spawn(owner.run()),
+        };
+
+        Ok(Running {
+            ingress,
+            world,
+            task,
+        })
+    }
+}
+
+/// Independent capabilities of one scheduled engine.
+#[derive(Debug)]
+#[must_use = "a running engine must retain its task owner until completion"]
+pub struct Running {
+    ingress: Ingress,
+    world: World,
+    task: Task,
+}
+
+impl Running {
+    /// Returns a cloneable observation capability.
+    #[must_use]
+    pub fn ingress(&self) -> Ingress {
+        self.ingress.clone()
+    }
+
+    /// Returns cloneable canonical-world access.
+    #[must_use]
+    pub fn world(&self) -> World {
+        self.world.clone()
+    }
+
+    /// Consumes the running product and returns its task owner.
+    ///
+    /// Consuming the product also drops its retained ingress capability. The
+    /// engine finishes once every independently cloned [`Ingress`] is dropped.
+    pub fn owner(self) -> Task {
+        self.task
+    }
+}
+
+/// Single owner of one scheduled engine task.
+#[derive(Debug)]
+#[must_use = "the engine task must be awaited to observe runtime failure"]
+pub struct Task {
+    handle: JoinHandle<()>,
+}
+
+impl Task {
+    /// Returns whether the scheduled engine has completed.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Waits for the scheduled engine to finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskError`] if the engine task was cancelled or panicked.
+    #[instrument(name = "viperzoo::engine::task::wait", skip(self), err)]
+    pub async fn wait(self) -> Result<(), TaskError> {
+        self.handle.await.map_err(TaskError::Join)
     }
 }
 
@@ -418,6 +511,22 @@ pub enum Error {
     Stopped,
 }
 
+/// Failure to schedule an engine owner.
+#[derive(Debug, Error)]
+pub enum SpawnError {
+    /// No Tokio runtime is active on the calling thread.
+    #[error("engine scheduling requires an active Tokio runtime: {0}")]
+    Runtime(tokio::runtime::TryCurrentError),
+}
+
+/// Failure of a scheduled engine task.
+#[derive(Debug, Error)]
+pub enum TaskError {
+    /// The scheduled owner was cancelled or panicked.
+    #[error("engine task failed: {0}")]
+    Join(tokio::task::JoinError),
+}
+
 /// Failure while advancing an atomic [`Subscription`].
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SubscriptionError {
@@ -462,6 +571,35 @@ mod tests {
 
     fn decode(flow: Flow, body: &[u8]) -> Result<packet::Packet, CodecError> {
         packet::Packet::try_from(Body::new(flow, body))
+    }
+
+    #[test]
+    fn scheduling_without_a_runtime_is_a_typed_error() {
+        let error = channel(Config::default())
+            .spawn()
+            .expect_err("no Tokio runtime is active");
+
+        assert!(matches!(error, SpawnError::Runtime(_)));
+    }
+
+    #[tokio::test]
+    async fn scheduled_engine_preserves_named_capabilities() {
+        let running = channel(Config::default())
+            .spawn()
+            .expect("test runtime schedules the engine");
+        let ingress = running.ingress();
+        let world = running.world();
+        let task = running.owner();
+
+        ingress
+            .observe(Observation::SessionStarted)
+            .await
+            .expect("scheduled engine accepts observations");
+
+        assert_eq!(world.latest().revision(), Revision::INITIAL.next());
+
+        drop(ingress);
+        task.wait().await.expect("scheduled engine stops");
     }
 
     #[tokio::test]
