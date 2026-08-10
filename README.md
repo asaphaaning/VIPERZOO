@@ -1,10 +1,66 @@
-# VIPERZOO
+<p align="center">
+  <img src="crates/web/assets/viperzoo-logo.png" alt="VIPERZOO" width="560">
+</p>
 
-`VIPERZOO` is a homage to someone whose creative output around a classic online 
+`VIPERZOO` is a homage to someone whose creative output around a classic online
 RPG made a deep impression on me when I was younger.
 
-It is my own spin on his defining contribution: A research project on the 
+It is my own spin on his defining contribution: A research project on the
 same game, built on a reverse-engineered protocol and a deterministic engine.
+
+## Quick start
+
+For a new application under `apps/`, add the SDK and the adapter that supplies
+its observations and actions:
+
+```toml
+[dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+viperzoo-adapter-frida = { path = "../../crates/adapter-frida" }
+viperzoo-sdk = { path = "../../crates/sdk" }
+```
+
+The SDK owns the canonical engine and adapter lifecycle. A started session
+exposes only the independent capabilities an application uses: a typed client,
+the coherent world, and one teardown owner.
+
+```rust
+use viperzoo_adapter_frida as frida;
+use viperzoo_sdk::{session, world::query};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let adapter = frida::Adapter::new(frida::Config::new(frida::Target::process(
+        "NexusTK.exe",
+    )));
+    let session = session()
+        .adapter(adapter)
+        .on_event(|event| eprintln!("{event:?}"))
+        .start()
+        .await?;
+
+    let position = session
+        .world
+        .wait(query::select(|snapshot| {
+            snapshot.player().location().position()
+        }))
+        .run()
+        .await?;
+
+    println!(
+        "localized at {}, {}",
+        position.x().value(),
+        position.y().value()
+    );
+    session.owner.shutdown().await?;
+
+    Ok(())
+}
+```
+
+`on_event` receives the adapter's closed, typed event vocabulary. Applications
+that need the stream directly can omit it; applications that intentionally do
+not use diagnostics can select `.discard_events()` instead.
 
 ## Workspace
 

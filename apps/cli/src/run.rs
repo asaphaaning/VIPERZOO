@@ -1,16 +1,11 @@
 //! Composition of the direct adapter and canonical engine owner.
 
-use std::time::Duration;
-
 use thiserror::Error;
-use tokio::time;
 use tracing::{info, instrument, warn};
 use viperzoo_adapter_frida::{self as frida, Event};
-use viperzoo_sdk::{Session, world::snapshot::Snapshot};
+use viperzoo_sdk::{session, world::snapshot::Snapshot};
 
 use crate::cli::Config;
-
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Runs direct acquisition until Ctrl+C or client detach.
 #[instrument(
@@ -23,37 +18,30 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let adapter_config = frida::Config::new(config.target().clone())
         .with_agent(config.agent().clone())
         .with_recording(config.recording().clone());
-    let session = Session::builder(frida::Adapter::new(adapter_config))
+    let session = session()
+        .adapter(frida::Adapter::new(adapter_config))
+        .on_event(report_event)
         .start()
         .await?;
     let _client = session.client;
-    let mut events = session.events;
     let world = session.world;
     let owner = session.owner;
     let mut snapshots = world.subscribe();
-    let mut ticker = time::interval(EVENT_POLL_INTERVAL);
 
     let stop = loop {
-        drain_events(&mut events);
-
-        if owner.is_finished() {
-            break Stop::Detached;
-        }
-
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result?;
                 break Stop::Interrupted;
             }
+            () = owner.finished() => break Stop::Detached,
             result = snapshots.changed() => {
                 let snapshot = result.map_err(|_| Error::WorldStopped)?;
                 print_summary(&snapshot);
             }
-            _ = ticker.tick() => {}
         }
     };
 
-    drain_events(&mut events);
     match stop {
         Stop::Interrupted => owner.shutdown().await?,
         Stop::Detached => owner.wait().await?,
@@ -62,53 +50,51 @@ pub async fn run(config: Config) -> Result<(), Error> {
     Ok(())
 }
 
-fn drain_events(events: &mut frida::Events) {
-    while let Some(event) = events.next_ready() {
-        match event {
-            Event::Attached(info) => info!(
-                pid = info.pid(),
-                frida = info.frida_version(),
-                "direct Frida attachment loaded"
-            ),
-            Event::Ready(info) => info!(pid = info.pid(), "plaintext packet hooks ready"),
-            Event::ResourcesSeeded(resources) => info!(
-                vita = resources.vita().current(),
-                max_vita = resources.vita().maximum(),
-                mana = resources.mana().current(),
-                max_mana = resources.mana().maximum(),
-                "player resources seeded from client memory"
-            ),
-            Event::InventorySeeded { capacity, occupied } => info!(
-                capacity,
-                occupied, "carried inventory seeded from client memory"
-            ),
-            Event::MapIdentitySeeded(identity) => info!(
-                map = identity.id().value(),
-                width = identity.dimensions().width(),
-                height = identity.dimensions().height(),
-                "map identity seeded from client memory"
-            ),
-            Event::TransportClosed => {
-                warn!("NexusTK game transport closed below the plaintext packet boundary");
-            }
-            Event::TransportFault(fault) => warn!(
-                operation = ?fault.operation(),
-                code = fault.code(),
-                "NexusTK game transport reported a socket fault"
-            ),
-            Event::Rejected(rejection) => warn!(
-                flow = ?rejection.flow(),
-                length = rejection.length(),
-                reason = rejection.reason(),
-                "Frida callback rejected"
-            ),
-            Event::Warning(message) => warn!(message = %message, "Frida agent warning"),
-            Event::ScriptError(problem) => warn!(
-                description = problem.description(),
-                stack = problem.stack(),
-                "Frida agent failed"
-            ),
+fn report_event(event: Event) {
+    match event {
+        Event::Attached(info) => info!(
+            pid = info.pid(),
+            frida = info.frida_version(),
+            "direct Frida attachment loaded"
+        ),
+        Event::Ready(info) => info!(pid = info.pid(), "plaintext packet hooks ready"),
+        Event::ResourcesSeeded(resources) => info!(
+            vita = resources.vita().current(),
+            max_vita = resources.vita().maximum(),
+            mana = resources.mana().current(),
+            max_mana = resources.mana().maximum(),
+            "player resources seeded from client memory"
+        ),
+        Event::InventorySeeded { capacity, occupied } => info!(
+            capacity,
+            occupied, "carried inventory seeded from client memory"
+        ),
+        Event::MapIdentitySeeded(identity) => info!(
+            map = identity.id().value(),
+            width = identity.dimensions().width(),
+            height = identity.dimensions().height(),
+            "map identity seeded from client memory"
+        ),
+        Event::TransportClosed => {
+            warn!("NexusTK game transport closed below the plaintext packet boundary");
         }
+        Event::TransportFault(fault) => warn!(
+            operation = ?fault.operation(),
+            code = fault.code(),
+            "NexusTK game transport reported a socket fault"
+        ),
+        Event::Rejected(rejection) => warn!(
+            flow = ?rejection.flow(),
+            length = rejection.length(),
+            reason = rejection.reason(),
+            "Frida callback rejected"
+        ),
+        Event::Warning(message) => warn!(message = %message, "Frida agent warning"),
+        Event::ScriptError(problem) => warn!(
+            description = problem.description(),
+            stack = problem.stack(),
+            "Frida agent failed"
+        ),
     }
 }
 

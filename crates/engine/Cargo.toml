@@ -7,7 +7,7 @@ version.workspace      = true
 
 [dependencies]
 thiserror.workspace  = true
-tokio                = { workspace = true, features = [ "sync", "time" ] }
+tokio                = { workspace = true, features = [ "rt", "sync", "time" ] }
 tracing.workspace    = true
 viperzoo-adapter-api = { version = "0.1.0", path = "../adapter-api" }
 viperzoo-world       = { version = "0.1.0", path = "../world" }
