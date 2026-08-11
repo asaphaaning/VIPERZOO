@@ -20,7 +20,7 @@ use viperzoo_protocol::{
 use crate::{action, entity, inventory, map, player, revision::Revision, session};
 
 /// Current stable snapshot schema.
-pub const SCHEMA_VERSION: &str = "0.12.0";
+pub const SCHEMA_VERSION: &str = "0.13.0";
 
 /// One immutable and internally consistent projected world.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -32,6 +32,7 @@ pub struct Snapshot {
     map: map::Snapshot,
     player: player::State,
     entities: Vec<entity::State>,
+    session_epoch: session::Epoch,
     connection: session::Connection,
     heartbeat: session::Heartbeat,
     recent_actions: Vec<action::Event>,
@@ -52,8 +53,7 @@ impl Snapshot {
         revision: Revision,
         counts: Counts,
         core: CoreState,
-        connection: session::Connection,
-        heartbeat: session::Heartbeat,
+        session: SessionState,
         actions: Actions,
         server: ServerState,
     ) -> Self {
@@ -65,8 +65,9 @@ impl Snapshot {
             map: core.map,
             player: core.player,
             entities: core.entities,
-            connection,
-            heartbeat,
+            session_epoch: session.epoch,
+            connection: session.connection,
+            heartbeat: session.heartbeat,
             recent_actions: actions.recent,
             recent_combat_actions: actions.combat,
             spellbook: server.spellbook,
@@ -137,6 +138,12 @@ impl Snapshot {
     pub fn ground_items_at(&self, position: Position) -> impl Iterator<Item = &entity::State> {
         self.entities_at(position)
             .filter(|entity| entity.appearance().is_floor_item())
+    }
+
+    /// Returns the adapter-attachment epoch that owns session-scoped facts.
+    #[must_use]
+    pub const fn session_epoch(&self) -> session::Epoch {
+        self.session_epoch
     }
 
     /// Returns the projected client-session lifecycle.
@@ -215,6 +222,28 @@ impl Snapshot {
     #[must_use]
     pub const fn travel_menu(&self) -> Option<&travel::Menu> {
         self.travel_menu.as_ref()
+    }
+}
+
+/// Attachment-scoped lifecycle state used to construct one [`Snapshot`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionState {
+    epoch: session::Epoch,
+    connection: session::Connection,
+    heartbeat: session::Heartbeat,
+}
+
+impl SessionState {
+    pub(crate) const fn new(
+        epoch: session::Epoch,
+        connection: session::Connection,
+        heartbeat: session::Heartbeat,
+    ) -> Self {
+        Self {
+            epoch,
+            connection,
+            heartbeat,
+        }
     }
 }
 

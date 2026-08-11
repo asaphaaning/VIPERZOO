@@ -132,9 +132,7 @@ where
             before,
             Stage::Facing,
             config.observation_timeout,
-            |action| {
-                matches!(action, observed::Action::Face { direction: value } if *value == direction)
-            },
+            observed::Action::Face { direction },
         )
         .await
         {
@@ -177,7 +175,7 @@ where
         before_attack,
         Stage::Attack,
         config.observation_timeout,
-        |action| matches!(action, observed::Action::Attack),
+        observed::Action::Attack,
     )
     .await?;
 
@@ -189,17 +187,16 @@ async fn wait_for_action<E>(
     after: Revision,
     stage: Stage,
     timeout: Duration,
-    matches: impl Fn(&observed::Action) -> bool,
+    expected: observed::Action,
 ) -> Result<Revision, Error<E>>
 where
     E: fmt::Debug + fmt::Display,
 {
     world
-        .wait(query::select(move |snapshot| {
-            find_action(snapshot, after, &matches)
-        }))
+        .wait(query::actions::observed_after(after, expected))
         .within(timeout)
         .await
+        .map(|evidence| evidence.revision())
         .map_err(|error| match error {
             WaitError::Closed => Error::WorldStopped,
             WaitError::Elapsed { .. } => Error::Unobserved(stage),
