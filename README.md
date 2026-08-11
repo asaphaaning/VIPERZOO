@@ -21,12 +21,13 @@ viperzoo-sdk = { path = "../../crates/sdk" }
 ```
 
 The SDK owns the canonical engine and adapter lifecycle. A started session
-exposes only the independent capabilities an application uses: a typed client,
-the coherent world, and one teardown owner.
+exposes only the independent capabilities an application uses: semantic
+actions, the coherent world, and one teardown owner.
 
 ```rust
 use viperzoo_adapter_frida as frida;
-use viperzoo_sdk::{session, world::query};
+use std::time::Duration;
+use viperzoo_sdk::{adapter::action::Action, session, world::query};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,26 +42,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let position = session
         .world
-        .wait(query::select(|snapshot| {
-            snapshot.player().location().position()
-        }))
+        .wait(query::position::known())
         .run()
         .await?;
 
     println!(
         "localized at {}, {}",
-        position.x().value(),
-        position.y().value()
+        position.value().x().value(),
+        position.value().y().value()
     );
+
+    let refreshed = session
+        .actions
+        .perform(Action::RefreshMap)
+        .confirm(query::position::known())
+        .within(Duration::from_secs(2))
+        .run()
+        .await?;
+
+    println!("refresh confirmed at revision {}", refreshed.evidence().revision().value());
     session.owner.shutdown().await?;
 
     Ok(())
 }
 ```
 
-`on_event` receives the adapter's closed, typed event vocabulary. Applications
-that need the stream directly can omit it; applications that intentionally do
-not use diagnostics can select `.discard_events()` instead.
+`perform` is lazy until `run` is awaited. `confirm` captures a pre-dispatch
+revision fence and returns both the adapter's typed dispatch receipt and dated
+canonical-world evidence. `on_event` receives the adapter's closed, typed event
+vocabulary; applications that need the stream directly can omit it, while
+applications that intentionally do not use diagnostics can select
+`.discard_events()`.
 
 ## Workspace
 

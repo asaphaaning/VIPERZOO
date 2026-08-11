@@ -180,9 +180,10 @@ impl Control {
 
 impl action::Client for Control {
     type Error = ActionError;
+    type Receipt = ActionReceipt;
 
-    async fn perform(&self, action: action::Action) -> Result<(), Self::Error> {
-        Control::perform(self, action).await.map(|_| ())
+    async fn perform(&self, action: action::Action) -> Result<Self::Receipt, Self::Error> {
+        Control::perform(self, action).await
     }
 }
 

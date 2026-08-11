@@ -5,8 +5,10 @@
 //! engine while leaving the concrete acquisition implementation in the
 //! application dependency graph. Its fluent builder either returns the
 //! adapter's typed event stream or owns an exhaustive event handler as part of
-//! the session lifecycle.
+//! the session lifecycle. [`action::Actions`] pairs adapter dispatch receipts
+//! with canonical post-dispatch world evidence.
 
+pub mod action;
 mod session;
 
 pub use session::{

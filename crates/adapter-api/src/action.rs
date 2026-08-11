@@ -488,14 +488,23 @@ pub enum MapData {
 /// Asynchronous client action boundary implemented by acquisition adapters.
 #[cfg_attr(
     any(test, feature = "test-util"),
-    mockall::automock(type Error = std::convert::Infallible;)
+    mockall::automock(
+        type Error = std::convert::Infallible;
+        type Receipt = ();
+    )
 )]
 pub trait Client: Send + Sync {
     /// Adapter-specific submission failure.
     type Error;
 
+    /// Adapter-specific evidence that dispatch crossed its owned boundary.
+    type Receipt;
+
     /// Delegates an action to an attached client-owned transport session.
-    fn perform(&self, action: Action) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn perform(
+        &self,
+        action: Action,
+    ) -> impl Future<Output = Result<Self::Receipt, Self::Error>> + Send;
 }
 
 /// A one-based spellbook slot accepted by the `NexusTK` client hotkey path.

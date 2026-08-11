@@ -45,7 +45,7 @@ async fn run(config: cli::Config) -> Result<(), Error> {
         frida::Config::new(config.client().clone()).with_recording(config.recording().clone()),
     );
     let session = session().adapter(adapter).discard_events().start().await?;
-    let control = session.client;
+    let action = session.actions;
     let world = session.world;
     let owner = session.owner;
     let target = Position::new(config.x(), config.y());
@@ -56,7 +56,7 @@ async fn run(config: cli::Config) -> Result<(), Error> {
         "static object collision catalog loaded"
     );
     let result = actions::walk::to_with_assets(
-        &control,
+        action.client(),
         &world,
         &assets,
         target,
