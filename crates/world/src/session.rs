@@ -19,6 +19,28 @@
 use serde::Serialize;
 use viperzoo_protocol::heartbeat;
 
+/// Monotonic adapter-attachment epoch within one canonical world.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct Epoch(u64);
+
+impl Epoch {
+    /// The state before an adapter has established its first session.
+    pub const INITIAL: Self = Self(0);
+
+    /// Returns the following attachment epoch.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    /// Returns the numeric attachment epoch.
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 /// Client session lifecycle projected from the plaintext protocol boundary.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

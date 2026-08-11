@@ -46,7 +46,7 @@ use crate::{
 /// assert!(change.is_projected());
 /// assert!(change.revision() > Revision::INITIAL);
 /// ```
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum Change {
     /// Ordering/evidence changed without changing a projected domain facet.
     Recorded(Revision),
@@ -79,6 +79,7 @@ pub struct World {
     map: map::State,
     player: player::State,
     entities: BTreeMap<viperzoo_protocol::primitive::EntityId, entity::State>,
+    session_epoch: session::Epoch,
     connection: session::Connection,
     heartbeat: session::Heartbeat,
     recent_actions: VecDeque<action::Event>,
@@ -214,8 +215,11 @@ impl World {
                 self.player.clone(),
                 self.entities.values().cloned().collect(),
             ),
-            self.connection,
-            self.heartbeat.clone(),
+            snapshot::SessionState::new(
+                self.session_epoch,
+                self.connection,
+                self.heartbeat.clone(),
+            ),
             snapshot::Actions::new(
                 self.recent_actions.iter().cloned().collect(),
                 self.recent_combat_actions.iter().cloned().collect(),
@@ -409,6 +413,7 @@ impl World {
         self.map = map::State::default();
         self.player = player::State::default();
         self.entities.clear();
+        self.session_epoch = self.session_epoch.next();
         self.connection = session::Connection::Active;
         self.heartbeat = session::Heartbeat::default();
         self.recent_actions.clear();

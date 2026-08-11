@@ -17,13 +17,15 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::{
     runtime::Handle,
-    sync::{mpsc, oneshot, watch},
+    sync::{broadcast, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use tracing::{debug, instrument};
 use viperzoo_adapter_api::observation::{self, Observation};
 use viperzoo_world::{
+    event::Event,
     query::{Query, State},
+    revision::Revision,
     snapshot::Snapshot,
     world::Change,
 };
@@ -33,20 +35,37 @@ use crate::Reducer;
 /// Bounded engine runtime configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
-    capacity: NonZeroUsize,
+    commands: NonZeroUsize,
+    events: NonZeroUsize,
 }
 
 impl Config {
     /// Creates a configuration with the given bounded command capacity.
     #[must_use]
     pub const fn new(capacity: NonZeroUsize) -> Self {
-        Self { capacity }
+        Self {
+            commands: capacity,
+            events: capacity,
+        }
     }
 
     /// Returns the maximum number of queued commands.
     #[must_use]
-    pub const fn capacity(self) -> NonZeroUsize {
-        self.capacity
+    pub const fn command_capacity(self) -> NonZeroUsize {
+        self.commands
+    }
+
+    /// Selects how many unconsumed canonical events each subscriber may retain.
+    #[must_use]
+    pub const fn with_event_capacity(mut self, capacity: NonZeroUsize) -> Self {
+        self.events = capacity;
+        self
+    }
+
+    /// Returns the maximum retained event count per subscriber.
+    #[must_use]
+    pub const fn event_capacity(self) -> NonZeroUsize {
+        self.events
     }
 }
 
@@ -286,6 +305,7 @@ impl observation::Sink for Ingress {
 #[derive(Clone, Debug)]
 pub struct World {
     snapshots: watch::Receiver<Arc<Snapshot>>,
+    events: broadcast::WeakSender<Event>,
 }
 
 impl World {
@@ -301,10 +321,16 @@ impl World {
     /// meet without a gap or duplicate revision.
     #[must_use]
     pub fn subscribe(&self) -> Subscription {
+        let events = self.events.upgrade().map(|events| events.subscribe());
         let mut snapshots = self.snapshots.clone();
         let latest = Arc::clone(&snapshots.borrow_and_update());
+        let cursor = Cursor::from_revision(latest.revision());
 
-        Subscription { latest, snapshots }
+        Subscription {
+            latest,
+            snapshots,
+            events: Events { cursor, events },
+        }
     }
 
     /// Prepares to resolve a pure world [`Query`] over current and future
@@ -325,6 +351,7 @@ impl World {
 pub struct Subscription {
     latest: Arc<Snapshot>,
     snapshots: watch::Receiver<Arc<Snapshot>>,
+    events: Events,
 }
 
 impl Subscription {
@@ -332,6 +359,24 @@ impl Subscription {
     #[must_use]
     pub fn latest(&self) -> Arc<Snapshot> {
         Arc::clone(&self.latest)
+    }
+
+    /// Returns the revision fence shared by the initial snapshot and events.
+    #[must_use]
+    pub const fn cursor(&self) -> Cursor {
+        self.events.cursor()
+    }
+
+    /// Borrows the ordered non-coalescing event stream.
+    #[must_use]
+    pub const fn events(&mut self) -> &mut Events {
+        &mut self.events
+    }
+
+    /// Consumes the subscription and retains only its ordered event stream.
+    #[must_use]
+    pub fn into_events(self) -> Events {
+        self.events
     }
 
     /// Waits for and returns the next canonical snapshot revision.
@@ -358,6 +403,86 @@ impl Subscription {
         Wait {
             source: Source::Borrowed(self),
             query,
+        }
+    }
+}
+
+/// A position in the canonical non-coalescing event timeline.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Cursor(u64);
+
+impl Cursor {
+    /// The cursor before any accepted observation.
+    pub const INITIAL: Self = Self(Revision::INITIAL.value());
+
+    const fn from_revision(revision: Revision) -> Self {
+        Self(revision.value())
+    }
+
+    const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+
+    const fn advance(self, count: u64) -> Self {
+        Self(self.0 + count)
+    }
+
+    /// Returns the numeric canonical revision represented by this cursor.
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// Ordered world edges following one atomic snapshot cursor.
+#[derive(Debug)]
+pub struct Events {
+    cursor: Cursor,
+    events: Option<broadcast::Receiver<Event>>,
+}
+
+impl Events {
+    /// Returns the most recently consumed event cursor.
+    #[must_use]
+    pub const fn cursor(&self) -> Cursor {
+        self.cursor
+    }
+
+    /// Waits for the next canonical edge without coalescing revisions.
+    ///
+    /// Events covered by the subscription's initial snapshot cursor are
+    /// skipped. A bounded receiver that falls behind reports [`EventError::Lagged`]
+    /// with the exact expected and next available cursors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventError::Lagged`] when retained capacity was exceeded, or
+    /// [`EventError::Closed`] when the engine owner stopped.
+    pub async fn next(&mut self) -> Result<Event, EventError> {
+        let Some(events) = self.events.as_mut() else {
+            return Err(EventError::Closed);
+        };
+
+        loop {
+            match events.recv().await {
+                Ok(event) if event.revision().value() <= self.cursor.value() => {}
+                Ok(event) => {
+                    self.cursor = Cursor::from_revision(event.revision());
+
+                    return Ok(event);
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    let expected = self.cursor.next();
+                    let available = expected.advance(missed);
+
+                    return Err(EventError::Lagged {
+                        expected,
+                        available,
+                        missed,
+                    });
+                }
+                Err(broadcast::error::RecvError::Closed) => return Err(EventError::Closed),
+            }
         }
     }
 }
@@ -434,6 +559,7 @@ impl Source<'_> {
 pub struct Owner {
     commands: mpsc::Receiver<Command>,
     snapshots: watch::Sender<Arc<Snapshot>>,
+    events: broadcast::Sender<Event>,
     reducer: Reducer,
 }
 
@@ -444,9 +570,13 @@ impl Owner {
         while let Some(command) = self.commands.recv().await {
             match command {
                 Command::Observe { observation, reply } => {
-                    let change = self.reducer.observe(*observation);
+                    let observation = *observation;
+                    let kind = viperzoo_world::event::Kind::from_observation(&observation);
+                    let change = self.reducer.observe(observation);
+                    let event = Event::new(change, kind);
                     self.snapshots
                         .send_replace(Arc::new(self.reducer.snapshot()));
+                    let _ = self.events.send(event);
                     let _ = reply.send(Receipt { change });
 
                     debug!(
@@ -463,22 +593,28 @@ impl Owner {
 /// Creates the connected capabilities of one live engine.
 #[instrument(
     name = "viperzoo::engine::channel",
-    fields(capacity = config.capacity().get()),
+    fields(
+        command_capacity = config.command_capacity().get(),
+        event_capacity = config.event_capacity().get()
+    ),
     ret(level = "trace")
 )]
 pub fn channel(config: Config) -> Channel {
     let reducer = Reducer::new();
-    let (commands, receiver) = mpsc::channel(config.capacity().get());
+    let (commands, receiver) = mpsc::channel(config.command_capacity().get());
     let (snapshots, subscription) = watch::channel(Arc::new(reducer.snapshot()));
+    let (events, _) = broadcast::channel(config.event_capacity().get());
 
     Channel {
         ingress: Ingress { commands },
         world: World {
             snapshots: subscription,
+            events: events.downgrade(),
         },
         owner: Owner {
             commands: receiver,
             snapshots,
+            events,
             reducer,
         },
     }
@@ -532,6 +668,26 @@ pub enum TaskError {
 pub enum SubscriptionError {
     /// The engine owner stopped before another revision was published.
     #[error("canonical world subscription is closed")]
+    Closed,
+}
+
+/// Failure while consuming canonical non-coalescing world events.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum EventError {
+    /// The receiver exceeded its bounded retention window.
+    #[error(
+        "world event stream lagged by {missed} revisions (expected {expected:?}, next available {available:?})"
+    )]
+    Lagged {
+        /// Cursor the consumer expected next.
+        expected: Cursor,
+        /// Oldest cursor still available to the consumer.
+        available: Cursor,
+        /// Number of canonical edges no longer retained.
+        missed: u64,
+    },
+    /// The engine owner stopped before another event was published.
+    #[error("canonical world event stream is closed")]
     Closed,
 }
 
@@ -667,6 +823,101 @@ mod tests {
             .expect("engine is running");
         let changed = subscription.changed().await.expect("publisher is alive");
         assert_eq!(changed.revision().value(), 2);
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn event_subscriptions_start_after_their_atomic_snapshot_cursor() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+
+        ingress
+            .observe(Observation::SessionStarted)
+            .await
+            .expect("engine is running");
+
+        let subscription = world.subscribe();
+        assert_eq!(subscription.cursor().value(), 1);
+        let mut events = subscription.into_events();
+
+        ingress
+            .observe(Observation::TransportClosed)
+            .await
+            .expect("engine is running");
+
+        let event = events.next().await.expect("future event is retained");
+        assert_eq!(event.revision().value(), 2);
+        assert_eq!(event.kind(), &viperzoo_world::event::Kind::TransportClosed);
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn event_subscriptions_preserve_every_ordered_revision() {
+        let channel = channel(Config::default());
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+        let mut events = world.subscribe().into_events();
+
+        ingress
+            .observe(Observation::SessionStarted)
+            .await
+            .expect("engine is running");
+        ingress
+            .observe(Observation::TransportClosed)
+            .await
+            .expect("engine is running");
+        ingress
+            .observe(Observation::SessionStarted)
+            .await
+            .expect("engine is running");
+
+        for expected in 1..=3 {
+            let event = events.next().await.expect("ordered event is retained");
+            assert_eq!(event.revision().value(), expected);
+        }
+
+        drop(ingress);
+        owner.await.expect("engine owner does not panic");
+    }
+
+    #[tokio::test]
+    async fn event_lag_reports_the_missing_cursor_range() {
+        let capacity = NonZeroUsize::new(1).expect("one is non-zero");
+        let channel = channel(Config::new(capacity).with_event_capacity(capacity));
+        let ingress = channel.ingress();
+        let world = channel.world();
+        let owner = tokio::spawn(channel.owner().run());
+        let mut events = world.subscribe().into_events();
+
+        for observation in [
+            Observation::SessionStarted,
+            Observation::TransportClosed,
+            Observation::SessionStarted,
+        ] {
+            ingress
+                .observe(observation)
+                .await
+                .expect("engine is running");
+        }
+
+        assert_eq!(
+            events.next().await,
+            Err(EventError::Lagged {
+                expected: Cursor(1),
+                available: Cursor(3),
+                missed: 2,
+            })
+        );
+
+        let available = events.next().await.expect("oldest retained event remains");
+        assert_eq!(available.revision().value(), 3);
 
         drop(ingress);
         owner.await.expect("engine owner does not panic");

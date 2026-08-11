@@ -10,7 +10,7 @@
 //!          │
 //!     Builder::start
 //!          │
-//!          ├─ client ──► actions
+//!          ├─ actions ──► dispatch + canonical confirmation
 //!          ├─ events ──► diagnostics
 //!          ├─ world  ──► queries
 //!          └─ owner  ──► wait | shutdown
@@ -34,6 +34,8 @@ use tokio_stream::StreamExt;
 use tracing::{Instrument, instrument};
 use viperzoo_adapter_api::runtime::{Adapter, Driver, Running as AdapterRunning};
 use viperzoo_engine as engine;
+
+use crate::action::Actions;
 
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -147,7 +149,7 @@ where
         } = start(self).await?;
 
         Ok(Session {
-            client,
+            actions: Actions::new(client, world.clone()),
             events,
             world,
             owner: Owner::new(driver, engine, None),
@@ -179,7 +181,7 @@ where
         let events = EventTask::spawn(events, self.handler);
 
         Ok(HandledSession {
-            client,
+            actions: Actions::new(client, world.clone()),
             world,
             owner: Owner::new(driver, engine, Some(events)),
         })
@@ -235,8 +237,8 @@ pub struct Session<A>
 where
     A: Adapter,
 {
-    /// Cloneable typed client-action capability.
-    pub client: A::Client,
+    /// Typed adapter actions paired with canonical world confirmation.
+    pub actions: Actions<A::Client>,
     /// Adapter-specific lifecycle and diagnostic event stream.
     pub events: A::Events,
     /// Cloneable read access to the canonical world.
@@ -252,8 +254,8 @@ pub struct HandledSession<A>
 where
     A: Adapter,
 {
-    /// Cloneable typed client-action capability.
-    pub client: A::Client,
+    /// Typed adapter actions paired with canonical world confirmation.
+    pub actions: Actions<A::Client>,
     /// Cloneable read access to the canonical world.
     pub world: engine::World,
     /// Single lifecycle authority for adapter, event, and engine teardown.

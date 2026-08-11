@@ -17,6 +17,7 @@
 
 pub mod action;
 pub mod entity;
+pub mod event;
 pub mod inventory;
 pub mod knowledge;
 pub mod map;

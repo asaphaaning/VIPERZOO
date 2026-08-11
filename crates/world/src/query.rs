@@ -4,8 +4,69 @@
 //! [`State::Ready`] value. Queries contain no waiting, clocks, channels, or
 //! retry policy; the asynchronous engine decides when to evaluate them again.
 //! This keeps domain questions deterministic and directly testable.
+//!
+//! Domain namespaces provide the ordinary vocabulary so applications rarely
+//! need to write snapshot closures themselves:
+//!
+//! ```
+//! use viperzoo_world::{query::{self, Query, State}, world::World};
+//!
+//! let snapshot = World::new().snapshot();
+//!
+//! assert_eq!(query::position::known().evaluate(&snapshot), State::Pending);
+//! assert_eq!(query::inventory::complete().evaluate(&snapshot), State::Pending);
+//! ```
 
 use crate::{revision::Revision, snapshot::Snapshot};
+
+pub mod actions;
+pub mod equipment;
+pub mod inventory;
+pub mod map;
+pub mod messages;
+pub mod position;
+pub mod readiness;
+pub mod resources;
+pub mod session;
+
+/// A query value dated by the coherent snapshot that established it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Evidence<T> {
+    value: T,
+    revision: Revision,
+}
+
+impl<T> Evidence<T> {
+    /// Dates `value` with the snapshot revision that established it.
+    #[must_use]
+    pub const fn new(value: T, revision: Revision) -> Self {
+        Self { value, revision }
+    }
+
+    /// Borrows the established value.
+    #[must_use]
+    pub const fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Consumes the evidence and returns its established value.
+    #[must_use]
+    pub fn into_value(self) -> T {
+        self.value
+    }
+
+    /// Returns the coherent world revision that established the value.
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    /// Transforms the value without losing its revision evidence.
+    #[must_use]
+    pub fn map<U>(self, transform: impl FnOnce(T) -> U) -> Evidence<U> {
+        Evidence::new(transform(self.value), self.revision)
+    }
+}
 
 /// The result of evaluating a [`Query`] against one snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

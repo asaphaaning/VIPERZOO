@@ -23,7 +23,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
         .on_event(report_event)
         .start()
         .await?;
-    let _client = session.client;
+    let _actions = session.actions;
     let world = session.world;
     let owner = session.owner;
     let mut snapshots = world.subscribe();

@@ -22,43 +22,7 @@ impl Event {
     /// Converts a client packet when it represents a player action.
     #[must_use]
     pub fn from_packet(packet: &client::Packet, revision: Revision) -> Option<Self> {
-        let action = match packet {
-            client::Packet::Speech(speech) => Action::Speak {
-                text: speech.text().into(),
-            },
-            client::Packet::Movement(movement) => Action::Step {
-                direction: movement.direction(),
-                origin: movement.origin(),
-                last_walk: movement.last_walk(),
-            },
-            client::Packet::Obstruction(obstruction) => Action::Obstruction {
-                origin: obstruction.origin(),
-                direction: obstruction.direction(),
-            },
-            client::Packet::Facing(facing) => Action::Face {
-                direction: facing.direction(),
-            },
-            client::Packet::Attack(_) => Action::Attack,
-            client::Packet::Pickup(_) => Action::Pickup,
-            client::Packet::Refresh(_) => Action::Refresh,
-            client::Packet::Disconnect(_) => Action::Disconnect,
-            client::Packet::UseInventory(item) => Action::UseInventory { slot: item.slot() },
-            client::Packet::Cast(cast) => Action::Cast { slot: cast.slot() },
-            client::Packet::Interact(interact) => Action::Interact {
-                entity: interact.entity(),
-            },
-            client::Packet::Dialog(dialog) => Action::Dialog {
-                entity: dialog.entity(),
-                command: dialog.command(),
-            },
-            client::Packet::TravelSelection(selection) => Action::TravelSelection {
-                map: selection.map(),
-                position: selection.position(),
-            },
-            client::Packet::Heartbeat(_) | client::Packet::Unknown(_) => return None,
-        };
-
-        Some(Self { revision, action })
+        Action::from_packet(packet).map(|action| Self { revision, action })
     }
 
     /// Returns the world revision that observed the action.
@@ -77,6 +41,67 @@ impl Event {
     #[must_use]
     pub const fn is_combat(&self) -> bool {
         matches!(self.action, Action::Attack | Action::Cast { .. })
+    }
+}
+
+impl Action {
+    /// Promotes a client packet into the canonical player-action vocabulary.
+    ///
+    /// Heartbeats and unknown packets are transport evidence rather than
+    /// player intent, so they return `None`.
+    #[must_use]
+    pub fn from_packet(packet: &client::Packet) -> Option<Self> {
+        match classify(packet) {
+            Packet::Action(action) => Some(action),
+            Packet::Heartbeat | Packet::Unknown => None,
+        }
+    }
+}
+
+pub(crate) enum Packet {
+    Action(Action),
+    Heartbeat,
+    Unknown,
+}
+
+pub(crate) fn classify(packet: &client::Packet) -> Packet {
+    match packet {
+        client::Packet::Speech(speech) => Packet::Action(Action::Speak {
+            text: speech.text().into(),
+        }),
+        client::Packet::Movement(movement) => Packet::Action(Action::Step {
+            direction: movement.direction(),
+            origin: movement.origin(),
+            last_walk: movement.last_walk(),
+        }),
+        client::Packet::Obstruction(obstruction) => Packet::Action(Action::Obstruction {
+            origin: obstruction.origin(),
+            direction: obstruction.direction(),
+        }),
+        client::Packet::Facing(facing) => Packet::Action(Action::Face {
+            direction: facing.direction(),
+        }),
+        client::Packet::Attack(_) => Packet::Action(Action::Attack),
+        client::Packet::Pickup(_) => Packet::Action(Action::Pickup),
+        client::Packet::Refresh(_) => Packet::Action(Action::Refresh),
+        client::Packet::Disconnect(_) => Packet::Action(Action::Disconnect),
+        client::Packet::UseInventory(item) => {
+            Packet::Action(Action::UseInventory { slot: item.slot() })
+        }
+        client::Packet::Cast(cast) => Packet::Action(Action::Cast { slot: cast.slot() }),
+        client::Packet::Interact(interact) => Packet::Action(Action::Interact {
+            entity: interact.entity(),
+        }),
+        client::Packet::Dialog(dialog) => Packet::Action(Action::Dialog {
+            entity: dialog.entity(),
+            command: dialog.command(),
+        }),
+        client::Packet::TravelSelection(selection) => Packet::Action(Action::TravelSelection {
+            map: selection.map(),
+            position: selection.position(),
+        }),
+        client::Packet::Heartbeat(_) => Packet::Heartbeat,
+        client::Packet::Unknown(_) => Packet::Unknown,
     }
 }
 

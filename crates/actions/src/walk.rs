@@ -402,7 +402,7 @@ where
             .await
             .map_err(Error::Client)?;
 
-        match wait_until(snapshots, config.readiness_timeout, localized).await {
+        match wait_until_localized(snapshots, config.readiness_timeout).await {
             Err(WaitError::Stopped) => return Err(Error::WorldStopped),
             Ok(()) | Err(WaitError::Timeout) => {}
         }
@@ -448,7 +448,7 @@ where
             .await
             .map_err(Error::Client)?;
 
-        match wait_until(snapshots, timeout, localized).await {
+        match wait_until_localized(snapshots, timeout).await {
             Ok(()) => return Ok(attempts),
             Err(WaitError::Stopped) => return Err(Error::WorldStopped),
             Err(WaitError::Timeout) => {}
@@ -500,15 +500,15 @@ fn step_outcome(
     .then_some(StepOutcome::Obstructed)
 }
 
-async fn wait_until(
+async fn wait_until_localized(
     snapshots: &mut Subscription,
     timeout: Duration,
-    predicate: impl Fn(&Snapshot) -> bool,
 ) -> Result<(), WaitError> {
     snapshots
-        .wait(query::when(predicate))
+        .wait(query::position::known())
         .within(timeout)
         .await
+        .map(|_| ())
         .map_err(wait_error)
 }
 
