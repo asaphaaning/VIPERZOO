@@ -46,7 +46,7 @@ use crate::{
 /// assert!(change.is_projected());
 /// assert!(change.revision() > Revision::INITIAL);
 /// ```
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum Change {
     /// Ordering/evidence changed without changing a projected domain facet.
     Recorded(Revision),
