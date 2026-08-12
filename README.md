@@ -2,18 +2,13 @@
   <img src="crates/web/assets/viperzoo-logo.png" alt="VIPERZOO" width="560">
 </p>
 
+![VIPERZOO web console](assets/web-console.png)
+
 `VIPERZOO` is a homage to someone whose creative output around a classic online
 RPG made a deep impression on me when I was younger.
 
 It is my own spin on his defining contribution: A research project on the
 same game, built on a reverse-engineered protocol and a deterministic engine.
-
-## Web Console
-
-The browser console presents the active world, character state, entities,
-inventory, decoder coverage, and tracing output in one live view.
-
-![VIPERZOO web console](assets/web-console.png)
 
 ## Quick start
 
