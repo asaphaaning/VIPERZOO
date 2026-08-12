@@ -24,7 +24,12 @@ pub fn identified() -> impl Query<Output = Evidence<Context>> {
 /// forcing applications that only need to name the active map to project a
 /// complete [`Context`] or unwrap its wire representation.
 pub fn id() -> impl Query<Output = Evidence<MapId>> {
-    identified().map(|evidence| evidence.map(|context| context.id()))
+    select(|snapshot| {
+        snapshot
+            .map()
+            .id()
+            .map(|id| Evidence::new(id, snapshot.revision()))
+    })
 }
 
 /// Resolves while `expected` is the active map identity.
@@ -34,11 +39,8 @@ pub fn id() -> impl Query<Output = Evidence<MapId>> {
 /// action confirmation.
 pub fn is(expected: MapId) -> impl Query<Output = Evidence<MapId>> {
     select(move |snapshot| {
-        snapshot
-            .map()
-            .context()
-            .filter(|context| context.id() == expected)
-            .map(|context| Evidence::new(context.id(), snapshot.revision()))
+        (snapshot.map().id() == Some(expected))
+            .then(|| Evidence::new(expected, snapshot.revision()))
     })
 }
 

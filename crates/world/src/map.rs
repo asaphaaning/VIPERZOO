@@ -26,7 +26,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Serialize, Serializer};
-use viperzoo_protocol::{map as protocol, primitive::Position};
+use viperzoo_protocol::{
+    map as protocol,
+    primitive::{MapId, Position},
+};
 
 /// How a map [`Epoch`] came to be.
 ///
@@ -547,6 +550,19 @@ impl Snapshot {
         match self {
             Self::Unidentified { .. } => None,
             Self::Identified { context, .. } => Some(context),
+        }
+    }
+
+    /// Returns the active map identity when observed.
+    ///
+    /// This is the identity-shaped counterpart to [`Snapshot::context`]. It
+    /// keeps callers that only need to name the active map from unwrapping a
+    /// complete [`Context`] or discarding the [`MapId`] wrapper themselves.
+    #[must_use]
+    pub const fn id(&self) -> Option<MapId> {
+        match self {
+            Self::Unidentified { .. } => None,
+            Self::Identified { context, .. } => Some(context.id()),
         }
     }
 
