@@ -1695,6 +1695,7 @@ dependencies = [
  "viperzoo-engine",
  "viperzoo-navigation",
  "viperzoo-protocol",
+ "viperzoo-web",
  "viperzoo-world",
 ]
 

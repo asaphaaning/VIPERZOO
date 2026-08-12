@@ -44,27 +44,29 @@ async fn run(config: cli::Config) -> Result<(), Error> {
     let adapter = frida::Adapter::new(
         frida::Config::new(config.client().clone()).with_recording(config.recording().clone()),
     );
-    let session = session().adapter(adapter).discard_events().start().await?;
-    let action = session.actions;
-    let world = session.world;
-    let owner = session.owner;
+    let session = session()
+        .adapter(adapter)
+        .discard_events()
+        .load_assets()?
+        .start()
+        .await?;
     let target = Position::new(config.x(), config.y());
-    let assets = assets::load_default()?;
+    let assets = session.assets().ok_or(Error::AssetsUnavailable)?;
     info!(
         definitions = assets.len(),
         source = %assets.source().display(),
         "static object collision catalog loaded"
     );
     let result = actions::walk::to_with_assets(
-        action.client(),
-        &world,
-        &assets,
+        session.actions().client(),
+        session.world(),
+        assets,
         target,
         actions::walk::Config::default(),
     )
     .await;
 
-    let session = owner.shutdown().await;
+    let session = session.shutdown().await;
     let report = result?;
 
     session?;
@@ -89,4 +91,6 @@ enum Error {
     Walk(#[from] actions::walk::Error<frida::ActionError>),
     #[error(transparent)]
     Assets(#[from] assets::LoadError),
+    #[error("session started without its selected static asset catalog")]
+    AssetsUnavailable,
 }

@@ -1,6 +1,6 @@
 //! Project the live engine into a browser as a read-only diagnostic console.
 //!
-//! An application that already owns an [`engine::World`] can start this
+//! An application that already owns an [`EngineWorld`] can start this
 //! alongside its normal work and then watch the same world state, and the same
 //! tracing output, from any machine on the network.
 //!
@@ -57,7 +57,10 @@ use axum::{
     routing::{get, post},
 };
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::{
+    sync::{broadcast, oneshot},
+    task::JoinHandle,
+};
 use tokio_stream::{Stream, StreamExt as _, wrappers::BroadcastStream};
 use tracing::{debug, info, instrument};
 use viperzoo_assets::Catalog;
@@ -152,6 +155,33 @@ impl Console {
         address: SocketAddr,
         controls: Option<control::Controls>,
     ) -> Result<(), Error> {
+        self.start(world, assets, address, controls)
+            .await?
+            .wait()
+            .await
+    }
+
+    /// Starts an owned console server.
+    ///
+    /// Binding completes before this method returns, so a configured console
+    /// cannot fail silently on a detached task. The returned [`Server`] is the
+    /// sole lifecycle authority and can be joined or shut down gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Bind`] when `address` cannot be bound.
+    #[instrument(
+        name = "viperzoo::web::start",
+        skip(self, world, assets, controls),
+        err
+    )]
+    pub async fn start(
+        &self,
+        world: EngineWorld,
+        assets: Option<Catalog>,
+        address: SocketAddr,
+        controls: Option<control::Controls>,
+    ) -> Result<Server, Error> {
         let state = Shared {
             events: self.events.clone(),
             history: Arc::clone(&self.history),
@@ -160,15 +190,7 @@ impl Console {
             controls,
         };
 
-        // One publisher serves every console: projecting once per interval and
-        // broadcasting keeps a second viewer from doubling the work, and keeps
-        // world frames from crowding out tracing on a busy session.
-        tokio::spawn(publish(
-            world,
-            assets,
-            self.events.clone(),
-            state.controls.clone(),
-        ));
+        let publisher_controls = state.controls.clone();
 
         let router = Router::new()
             .route("/", get(async || Html(PAGE)))
@@ -182,9 +204,107 @@ impl Console {
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .map_err(|source| Error::Bind { address, source })?;
+        let address = listener
+            .local_addr()
+            .map_err(|source| Error::Bind { address, source })?;
+        // One publisher serves every console: projecting once per interval and
+        // broadcasting keeps a second viewer from doubling the work, and keeps
+        // world frames from crowding out tracing on a busy session.
+        let publisher = tokio::spawn(publish(
+            world,
+            assets,
+            self.events.clone(),
+            publisher_controls,
+        ));
+        let (shutdown, requested) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = requested.await;
+                })
+                .await
+                .map_err(Error::Serve)
+        });
+        let task = tokio::spawn(own(publisher, server));
 
         info!(%address, "console available");
-        axum::serve(listener, router).await.map_err(Error::Serve)
+        Ok(Server {
+            address,
+            shutdown: Some(shutdown),
+            task,
+        })
+    }
+}
+
+/// Single lifecycle authority for one bound diagnostic console.
+#[derive(Debug)]
+#[must_use = "a running console must be waited or shut down"]
+pub struct Server {
+    address: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<Result<(), Error>>,
+}
+
+impl Server {
+    /// Returns the address selected by the bound listener.
+    #[must_use]
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Returns whether the HTTP server has already stopped.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    /// Waits for natural console termination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`enum@Error`] when the server or its owning task fails.
+    #[instrument(name = "viperzoo::web::server::wait", skip(self), err)]
+    pub async fn wait(self) -> Result<(), Error> {
+        self.finish(false).await
+    }
+
+    /// Requests graceful console termination and joins its owned tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`enum@Error`] when the server or its owning task fails.
+    #[instrument(name = "viperzoo::web::server::shutdown", skip(self), err)]
+    pub async fn shutdown(self) -> Result<(), Error> {
+        self.finish(true).await
+    }
+
+    async fn finish(mut self, request_shutdown: bool) -> Result<(), Error> {
+        if request_shutdown && let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+
+        self.task.await.map_err(Error::Task)?
+    }
+}
+
+async fn own(
+    mut publisher: JoinHandle<()>,
+    mut server: JoinHandle<Result<(), Error>>,
+) -> Result<(), Error> {
+    tokio::select! {
+        result = &mut server => {
+            publisher.abort();
+            let _ = publisher.await;
+
+            result.map_err(Error::ServerTask)?
+        }
+        result = &mut publisher => {
+            server.abort();
+            let _ = server.await;
+
+            result.map_err(Error::PublisherTask)?;
+            Err(Error::PublisherStopped)
+        }
     }
 }
 
@@ -325,4 +445,16 @@ pub enum Error {
     /// The HTTP server stopped with an error.
     #[error("console server failed: {0}")]
     Serve(#[source] std::io::Error),
+    /// The console lifecycle supervisor was cancelled or panicked.
+    #[error("console lifecycle task failed: {0}")]
+    Task(#[source] tokio::task::JoinError),
+    /// The owned HTTP task was cancelled or panicked.
+    #[error("console server task failed: {0}")]
+    ServerTask(#[source] tokio::task::JoinError),
+    /// The world publisher was cancelled or panicked unexpectedly.
+    #[error("console publisher task failed: {0}")]
+    PublisherTask(#[source] tokio::task::JoinError),
+    /// The world publisher stopped without a console shutdown request.
+    #[error("console publisher stopped unexpectedly")]
+    PublisherStopped,
 }

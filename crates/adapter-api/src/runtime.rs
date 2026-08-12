@@ -1,6 +1,6 @@
 //! Compose acquisition without prescribing a transport or executor.
 //!
-//! An [`Adapter`] starts with one observation [`Sink`] and yields three
+//! An [`Adapter`] starts with one observation [`observation::Sink`] and yields three
 //! independent capabilities:
 //!
 //! ```text
@@ -18,6 +18,91 @@ use std::future::Future;
 use futures_core::Stream;
 
 use crate::{action, observation};
+
+/// One runtime facility an [`Adapter`] makes available to an application.
+///
+/// The vocabulary describes capabilities, not configuration. For example,
+/// [`Capability::Recording`] says the selected adapter is actively retaining
+/// evidence for this run; the adapter still owns the transport-specific policy
+/// that selected where and how that evidence is written.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum Capability {
+    /// Typed application actions can cross the adapter boundary.
+    Actions,
+    /// A closed adapter-specific diagnostic event stream is available.
+    Events,
+    /// Late attachment seeds canonical state from validated client memory.
+    WarmAttachment,
+    /// Raw boundary evidence is being persisted for replay or analysis.
+    Recording,
+}
+
+impl Capability {
+    /// Every canonical adapter capability in declaration order.
+    pub const VARIANTS: [Self; 4] = [
+        Self::Actions,
+        Self::Events,
+        Self::WarmAttachment,
+        Self::Recording,
+    ];
+
+    const fn mask(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// The closed set of facilities active for one adapter session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Capabilities {
+    bits: u8,
+}
+
+impl Capabilities {
+    /// No optional adapter facilities.
+    pub const NONE: Self = Self { bits: 0 };
+
+    /// Creates a capability set from the selected vocabulary.
+    #[must_use]
+    pub const fn new(capabilities: &[Capability]) -> Self {
+        let mut result = Self::NONE;
+        let mut index = 0;
+
+        while index < capabilities.len() {
+            result = result.with(capabilities[index]);
+            index += 1;
+        }
+
+        result
+    }
+
+    /// Returns a set that also contains `capability`.
+    #[must_use]
+    pub const fn with(self, capability: Capability) -> Self {
+        Self {
+            bits: self.bits | capability.mask(),
+        }
+    }
+
+    /// Returns a set that contains `capability` exactly when `enabled`.
+    #[must_use]
+    pub const fn with_if(self, capability: Capability, enabled: bool) -> Self {
+        if enabled { self.with(capability) } else { self }
+    }
+
+    /// Returns whether `capability` is active.
+    #[must_use]
+    pub const fn contains(self, capability: Capability) -> bool {
+        self.bits & capability.mask() != 0
+    }
+
+    /// Iterates active capabilities in canonical order.
+    pub fn iter(self) -> impl Iterator<Item = Capability> {
+        Capability::VARIANTS
+            .into_iter()
+            .filter(move |capability| self.contains(*capability))
+    }
+}
 
 /// The independent capabilities produced by a running [`Adapter`].
 #[derive(Debug)]
@@ -54,6 +139,9 @@ pub trait Adapter: Sized {
     type Driver: Driver<Error = Self::Error>;
     /// Adapter startup and lifecycle failure.
     type Error;
+
+    /// Returns the facilities active for this configured adapter.
+    fn capabilities(&self) -> Capabilities;
 
     /// Starts acquisition against the given observation sink.
     fn start<S>(self, sink: S) -> impl Future<Output = Result<Started<Self>, Self::Error>> + Send
@@ -110,6 +198,10 @@ mod tests {
         type Event = Infallible;
         type Events = tokio_stream::Empty<Infallible>;
 
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::new(&[Capability::Actions, Capability::Events])
+        }
+
         async fn start<S>(
             self,
             sink: S,
@@ -127,6 +219,21 @@ mod tests {
                 self.driver,
             ))
         }
+    }
+
+    #[test]
+    fn capabilities_are_closed_and_canonically_ordered() {
+        let capabilities = Capabilities::new(&[
+            Capability::Recording,
+            Capability::Actions,
+            Capability::Recording,
+        ]);
+
+        assert_eq!(
+            capabilities.iter().collect::<Vec<_>>(),
+            vec![Capability::Actions, Capability::Recording]
+        );
+        assert!(!capabilities.contains(Capability::WarmAttachment));
     }
 
     #[tokio::test]

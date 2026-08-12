@@ -2,18 +2,20 @@
 //!
 //! [`Builder`] is a lazy value: configuring it has no effect until
 //! [`Builder::start`] is awaited. A successful start returns the independent
-//! application capabilities in one named [`Session`]. Its [`Owner`] is the
-//! single teardown authority and always joins both the adapter and engine.
+//! application capabilities in one named [`Session`]. The session itself is
+//! the single teardown authority and always joins every selected facility.
 //!
 //! ```text
 //! session() + Adapter + engine::Config
 //!          │
 //!     Builder::start
 //!          │
-//!          ├─ actions ──► dispatch + canonical confirmation
-//!          ├─ events ──► diagnostics
-//!          ├─ world  ──► queries
-//!          └─ owner  ──► wait | shutdown
+//!          ├─ actions      ──► dispatch + canonical confirmation
+//!          ├─ events       ──► adapter diagnostics
+//!          ├─ world        ──► queries
+//!          ├─ assets       ──► optional static client knowledge
+//!          ├─ capabilities ──► active adapter facilities
+//!          └─ lifecycle    ──► wait | shutdown ──► Report
 //! ```
 //!
 //! Applications may retain the adapter event stream from [`Session`] or make
@@ -26,16 +28,18 @@
 //!     .start()
 //! ```
 
-use std::{error::Error as StdError, time::Duration};
+use std::{error::Error as StdError, net::SocketAddr, time::Duration};
 
 use thiserror::Error as ThisError;
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tracing::{Instrument, instrument};
-use viperzoo_adapter_api::runtime::{Adapter, Driver, Running as AdapterRunning};
+use viperzoo_adapter_api::runtime::{Adapter, Capabilities, Driver, Running as AdapterRunning};
+use viperzoo_assets::Catalog;
 use viperzoo_engine as engine;
+use viperzoo_world::revision::Revision;
 
-use crate::action::Actions;
+use crate::{action::Actions, diagnostics};
 
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -54,6 +58,8 @@ pub fn session() -> Builder {
 pub struct Builder<A = ()> {
     adapter: A,
     engine: engine::Config,
+    assets: Option<Catalog>,
+    diagnostics: Option<diagnostics::Console>,
 }
 
 impl Builder {
@@ -61,6 +67,8 @@ impl Builder {
         Self {
             adapter: (),
             engine: engine::Config::default(),
+            assets: None,
+            diagnostics: None,
         }
     }
 
@@ -69,6 +77,8 @@ impl Builder {
         Builder {
             adapter,
             engine: self.engine,
+            assets: self.assets,
+            diagnostics: self.diagnostics,
         }
     }
 }
@@ -77,6 +87,28 @@ impl<A> Builder<A> {
     /// Selects the canonical engine configuration.
     pub const fn engine(mut self, engine: engine::Config) -> Self {
         self.engine = engine;
+        self
+    }
+
+    /// Supplies static client assets to session facilities and applications.
+    pub fn assets(mut self, assets: Catalog) -> Self {
+        self.assets = Some(assets);
+        self
+    }
+
+    /// Loads the default client asset catalog into this builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`viperzoo_assets::LoadError`] when the installed client assets
+    /// cannot be located or decoded.
+    pub fn load_assets(self) -> Result<Self, viperzoo_assets::LoadError> {
+        Ok(self.assets(viperzoo_assets::load_default()?))
+    }
+
+    /// Adds an SDK-owned browser diagnostic console.
+    pub fn diagnostics(mut self, diagnostics: diagnostics::Console) -> Self {
+        self.diagnostics = Some(diagnostics);
         self
     }
 }
@@ -88,7 +120,7 @@ where
     /// Delegates every typed adapter event to `handler` for the session lifetime.
     ///
     /// The handler runs on an SDK-owned task. The returned
-    /// [`HandledSession`] has no event stream because its [`Owner`] now owns
+    /// [`HandledSession`] has no event stream because the session now owns
     /// event delivery and joins the handler during teardown. Handlers should
     /// remain brief and non-blocking; applications needing asynchronous event
     /// policy should retain the stream returned by [`Builder::start`].
@@ -122,6 +154,29 @@ impl<A, F> HandledBuilder<A, F> {
         self.builder = self.builder.engine(engine);
         self
     }
+
+    /// Supplies static client assets to session facilities and applications.
+    pub fn assets(mut self, assets: Catalog) -> Self {
+        self.builder = self.builder.assets(assets);
+        self
+    }
+
+    /// Loads the default client asset catalog into this builder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`viperzoo_assets::LoadError`] when the installed client assets
+    /// cannot be located or decoded.
+    pub fn load_assets(mut self) -> Result<Self, viperzoo_assets::LoadError> {
+        self.builder = self.builder.load_assets()?;
+        Ok(self)
+    }
+
+    /// Adds an SDK-owned browser diagnostic console.
+    pub fn diagnostics(mut self, diagnostics: diagnostics::Console) -> Self {
+        self.builder = self.builder.diagnostics(diagnostics);
+        self
+    }
 }
 
 impl<A> Builder<A>
@@ -146,13 +201,18 @@ where
             driver,
             world,
             engine,
+            assets,
+            capabilities,
+            diagnostics,
         } = start(self).await?;
 
         Ok(Session {
             actions: Actions::new(client, world.clone()),
             events,
-            world,
-            owner: Owner::new(driver, engine, None),
+            world: world.clone(),
+            assets,
+            capabilities,
+            owner: Owner::new(driver, engine, None, diagnostics, world, capabilities),
         })
     }
 }
@@ -177,13 +237,25 @@ where
             driver,
             world,
             engine,
+            assets,
+            capabilities,
+            diagnostics,
         } = start(self.builder).await?;
         let events = EventTask::spawn(events, self.handler);
 
         Ok(HandledSession {
             actions: Actions::new(client, world.clone()),
-            world,
-            owner: Owner::new(driver, engine, Some(events)),
+            world: world.clone(),
+            assets,
+            capabilities,
+            owner: Owner::new(
+                driver,
+                engine,
+                Some(events),
+                diagnostics,
+                world,
+                capabilities,
+            ),
         })
     }
 }
@@ -197,6 +269,9 @@ where
     driver: A::Driver,
     world: engine::World,
     engine: engine::Task,
+    assets: Option<Catalog>,
+    capabilities: Capabilities,
+    diagnostics: Option<viperzoo_web::Server>,
 }
 
 async fn start<A>(builder: Builder<A>) -> Result<Started<A>, Error<A::Error>>
@@ -204,12 +279,30 @@ where
     A: Adapter,
     A::Error: StdError + Send + Sync + 'static,
 {
+    let capabilities = builder.adapter.capabilities();
+    let assets = builder.assets;
+    let configured_diagnostics = builder.diagnostics;
     let engine = engine::channel(builder.engine)
         .spawn()
         .map_err(Error::EngineStart)?;
     let ingress = engine.ingress();
     let world = engine.world();
     let engine = engine.owner();
+    let diagnostics = match configured_diagnostics {
+        Some(diagnostics) => match diagnostics.start(world.clone(), assets.clone()).await {
+            Ok(diagnostics) => Some(diagnostics),
+            Err(diagnostics) => {
+                drop(ingress);
+                let engine = engine.wait().await.err();
+
+                return Err(Error::DiagnosticsStart {
+                    diagnostics,
+                    engine,
+                });
+            }
+        },
+        None => None,
+    };
 
     match builder.adapter.start(ingress).await {
         Ok(AdapterRunning {
@@ -222,11 +315,20 @@ where
             driver,
             world,
             engine,
+            assets,
+            capabilities,
+            diagnostics,
         }),
-        Err(adapter) => match engine.wait().await {
-            Ok(()) => Err(Error::Adapter(adapter)),
-            Err(engine) => Err(Error::AdapterAndEngine { adapter, engine }),
-        },
+        Err(adapter) => {
+            let diagnostics = shutdown_diagnostics(diagnostics).await.err();
+            let engine = engine.wait().await.err();
+
+            Err(Error::AdapterStart {
+                adapter,
+                diagnostics,
+                engine,
+            })
+        }
     }
 }
 
@@ -237,14 +339,81 @@ pub struct Session<A>
 where
     A: Adapter,
 {
-    /// Typed adapter actions paired with canonical world confirmation.
-    pub actions: Actions<A::Client>,
-    /// Adapter-specific lifecycle and diagnostic event stream.
-    pub events: A::Events,
-    /// Cloneable read access to the canonical world.
-    pub world: engine::World,
-    /// Single lifecycle authority for adapter and engine teardown.
-    pub owner: Owner<A::Driver>,
+    actions: Actions<A::Client>,
+    events: A::Events,
+    world: engine::World,
+    assets: Option<Catalog>,
+    capabilities: Capabilities,
+    owner: Owner<A::Driver>,
+}
+
+impl<A> Session<A>
+where
+    A: Adapter,
+{
+    /// Borrows typed actions paired with canonical world confirmation.
+    #[must_use]
+    pub const fn actions(&self) -> &Actions<A::Client> {
+        &self.actions
+    }
+
+    /// Borrows the adapter-specific lifecycle and diagnostic event stream.
+    #[must_use]
+    pub fn events(&mut self) -> &mut A::Events {
+        &mut self.events
+    }
+
+    /// Borrows cloneable read access to the canonical world.
+    #[must_use]
+    pub const fn world(&self) -> &engine::World {
+        &self.world
+    }
+
+    /// Borrows static client assets when selected on the builder.
+    #[must_use]
+    pub const fn assets(&self) -> Option<&Catalog> {
+        self.assets.as_ref()
+    }
+
+    /// Returns the facilities active on the configured adapter.
+    #[must_use]
+    pub const fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    /// Returns the bound diagnostic address when a console is active.
+    #[must_use]
+    pub fn diagnostics_address(&self) -> Option<SocketAddr> {
+        self.owner.diagnostics_address()
+    }
+}
+
+impl<A> Session<A>
+where
+    A: Adapter,
+    A::Driver: Driver,
+    <A::Driver as Driver>::Error: StdError + Send + Sync + 'static,
+{
+    /// Returns whether any owned runtime authority has stopped.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.owner.is_finished()
+    }
+
+    /// Waits until any owned runtime authority stops.
+    pub async fn finished(&self) {
+        self.owner.finished().await;
+    }
+
+    /// Waits for natural termination and reports the completed session shape.
+    pub async fn wait(self) -> Result<Report, Error<<A::Driver as Driver>::Error>> {
+        self.owner.wait().await
+    }
+
+    /// Requests termination and reports the completed session shape.
+    pub async fn shutdown(self) -> Result<Report, Error<<A::Driver as Driver>::Error>> {
+        self.owner.shutdown().await
+    }
 }
 
 /// Consumer capabilities of a session whose events are handled by the SDK.
@@ -254,30 +423,109 @@ pub struct HandledSession<A>
 where
     A: Adapter,
 {
-    /// Typed adapter actions paired with canonical world confirmation.
-    pub actions: Actions<A::Client>,
-    /// Cloneable read access to the canonical world.
-    pub world: engine::World,
-    /// Single lifecycle authority for adapter, event, and engine teardown.
-    pub owner: Owner<A::Driver>,
+    actions: Actions<A::Client>,
+    world: engine::World,
+    assets: Option<Catalog>,
+    capabilities: Capabilities,
+    owner: Owner<A::Driver>,
 }
 
-/// Single lifecycle authority for a [`Session`].
+impl<A> HandledSession<A>
+where
+    A: Adapter,
+{
+    /// Borrows typed actions paired with canonical world confirmation.
+    #[must_use]
+    pub const fn actions(&self) -> &Actions<A::Client> {
+        &self.actions
+    }
+
+    /// Borrows cloneable read access to the canonical world.
+    #[must_use]
+    pub const fn world(&self) -> &engine::World {
+        &self.world
+    }
+
+    /// Borrows static client assets when selected on the builder.
+    #[must_use]
+    pub const fn assets(&self) -> Option<&Catalog> {
+        self.assets.as_ref()
+    }
+
+    /// Returns the facilities active on the configured adapter.
+    #[must_use]
+    pub const fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    /// Returns the bound diagnostic address when a console is active.
+    #[must_use]
+    pub fn diagnostics_address(&self) -> Option<SocketAddr> {
+        self.owner.diagnostics_address()
+    }
+}
+
+impl<A> HandledSession<A>
+where
+    A: Adapter,
+    A::Driver: Driver,
+    <A::Driver as Driver>::Error: StdError + Send + Sync + 'static,
+{
+    /// Returns whether any owned runtime authority has stopped.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.owner.is_finished()
+    }
+
+    /// Waits until any owned runtime authority stops.
+    pub async fn finished(&self) {
+        self.owner.finished().await;
+    }
+
+    /// Waits for natural termination and reports the completed session shape.
+    pub async fn wait(self) -> Result<Report, Error<<A::Driver as Driver>::Error>> {
+        self.owner.wait().await
+    }
+
+    /// Requests termination and reports the completed session shape.
+    pub async fn shutdown(self) -> Result<Report, Error<<A::Driver as Driver>::Error>> {
+        self.owner.shutdown().await
+    }
+}
+
+/// Runtime authorities hidden behind a [`Session`].
 #[derive(Debug)]
 #[must_use = "the session owner must be awaited to observe teardown"]
-pub struct Owner<D> {
+struct Owner<D> {
     driver: D,
     engine: engine::Task,
     events: Option<EventTask>,
+    diagnostics: Option<viperzoo_web::Server>,
+    world: engine::World,
+    capabilities: Capabilities,
 }
 
 impl<D> Owner<D> {
-    const fn new(driver: D, engine: engine::Task, events: Option<EventTask>) -> Self {
+    const fn new(
+        driver: D,
+        engine: engine::Task,
+        events: Option<EventTask>,
+        diagnostics: Option<viperzoo_web::Server>,
+        world: engine::World,
+        capabilities: Capabilities,
+    ) -> Self {
         Self {
             driver,
             engine,
             events,
+            diagnostics,
+            world,
+            capabilities,
         }
+    }
+
+    fn diagnostics_address(&self) -> Option<SocketAddr> {
+        self.diagnostics.as_ref().map(viperzoo_web::Server::address)
     }
 }
 
@@ -305,6 +553,10 @@ impl EventTask {
         }
     }
 
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
     #[instrument(name = "viperzoo::sdk::session::events::wait", skip(self), err)]
     async fn wait(self) -> Result<(), EventError> {
         self.handle.await.map_err(EventError::Join)
@@ -318,17 +570,23 @@ where
 {
     /// Returns whether the adapter driver has already stopped.
     #[must_use]
-    pub fn is_finished(&self) -> bool {
-        self.driver.is_finished() || self.engine.is_finished()
+    fn is_finished(&self) -> bool {
+        self.driver.is_finished()
+            || self.engine.is_finished()
+            || self.events.as_ref().is_some_and(EventTask::is_finished)
+            || self
+                .diagnostics
+                .as_ref()
+                .is_some_and(viperzoo_web::Server::is_finished)
     }
 
     /// Waits until the adapter or canonical engine has finished.
     ///
     /// This borrows the owner so it can be selected alongside application
-    /// work. Call [`Owner::wait`] or [`Owner::shutdown`] afterward to consume
-    /// ownership and surface the final lifecycle result.
+    /// work. Call [`Session::wait`] or [`Session::shutdown`] afterward to
+    /// consume ownership and surface the final lifecycle result.
     #[instrument(name = "viperzoo::sdk::session::finished", skip(self))]
-    pub async fn finished(&self) {
+    async fn finished(&self) {
         while !self.is_finished() {
             tokio::time::sleep(LIFECYCLE_POLL_INTERVAL).await;
         }
@@ -341,17 +599,43 @@ where
     /// Returns [`Error`] if adapter teardown, typed event delivery, or the
     /// engine task fails. Combined failures retain every failed authority.
     #[instrument(name = "viperzoo::sdk::session::wait", skip(self), err)]
-    pub async fn wait(self) -> Result<(), Error<D::Error>> {
+    async fn wait(self) -> Result<Report, Error<D::Error>> {
+        self.finished().await;
+        let adapter_finished = self.driver.is_finished();
         let Self {
             driver,
             engine,
             events,
+            diagnostics,
+            world,
+            capabilities,
         } = self;
-        let adapter = driver.wait().await;
+        let events_handled = events.is_some();
+        let diagnostics_address = diagnostics.as_ref().map(viperzoo_web::Server::address);
+        let adapter = if adapter_finished {
+            driver.wait().await
+        } else {
+            driver.shutdown().await
+        };
         let events = wait_events(events).await;
+        let diagnostics = shutdown_diagnostics(diagnostics).await;
         let engine = engine.wait().await;
 
-        finish(adapter, events, engine)
+        finish(
+            Report {
+                termination: Termination::Natural,
+                revision: world.latest().revision(),
+                capabilities,
+                events_handled,
+                diagnostics_address,
+            },
+            Outcomes {
+                adapter,
+                events,
+                diagnostics,
+                engine,
+            },
+        )
     }
 
     /// Requests adapter termination, then joins the engine owner.
@@ -361,17 +645,37 @@ where
     /// Returns [`Error`] if adapter teardown, typed event delivery, or the
     /// engine task fails. Combined failures retain every failed authority.
     #[instrument(name = "viperzoo::sdk::session::shutdown", skip(self), err)]
-    pub async fn shutdown(self) -> Result<(), Error<D::Error>> {
+    async fn shutdown(self) -> Result<Report, Error<D::Error>> {
         let Self {
             driver,
             engine,
             events,
+            diagnostics,
+            world,
+            capabilities,
         } = self;
+        let events_handled = events.is_some();
+        let diagnostics_address = diagnostics.as_ref().map(viperzoo_web::Server::address);
         let adapter = driver.shutdown().await;
         let events = wait_events(events).await;
+        let diagnostics = shutdown_diagnostics(diagnostics).await;
         let engine = engine.wait().await;
 
-        finish(adapter, events, engine)
+        finish(
+            Report {
+                termination: Termination::Requested,
+                revision: world.latest().revision(),
+                capabilities,
+                events_handled,
+                diagnostics_address,
+            },
+            Outcomes {
+                adapter,
+                events,
+                diagnostics,
+                engine,
+            },
+        )
     }
 }
 
@@ -382,27 +686,153 @@ async fn wait_events(events: Option<EventTask>) -> Result<(), EventError> {
     }
 }
 
-fn finish<E>(
+async fn shutdown_diagnostics(
+    diagnostics: Option<viperzoo_web::Server>,
+) -> Result<(), viperzoo_web::Error> {
+    match diagnostics {
+        Some(diagnostics) => diagnostics.shutdown().await,
+        None => Ok(()),
+    }
+}
+
+struct Outcomes<E> {
     adapter: Result<(), E>,
     events: Result<(), EventError>,
+    diagnostics: Result<(), viperzoo_web::Error>,
     engine: Result<(), engine::TaskError>,
-) -> Result<(), Error<E>>
+}
+
+fn finish<E>(report: Report, outcomes: Outcomes<E>) -> Result<Report, Error<E>>
 where
     E: StdError + 'static,
 {
-    match (adapter, events, engine) {
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
-        (Err(adapter), Ok(()), Ok(())) => Err(Error::Adapter(adapter)),
-        (Ok(()), Err(events), Ok(())) => Err(Error::Events(events)),
-        (Ok(()), Ok(()), Err(engine)) => Err(Error::Engine(engine)),
-        (Err(adapter), Err(events), Ok(())) => Err(Error::AdapterAndEvents { adapter, events }),
-        (Err(adapter), Ok(()), Err(engine)) => Err(Error::AdapterAndEngine { adapter, engine }),
-        (Ok(()), Err(events), Err(engine)) => Err(Error::EventsAndEngine { events, engine }),
-        (Err(adapter), Err(events), Err(engine)) => Err(Error::AdapterEventsAndEngine {
-            adapter,
-            events,
-            engine,
-        }),
+    if outcomes.adapter.is_ok()
+        && outcomes.events.is_ok()
+        && outcomes.diagnostics.is_ok()
+        && outcomes.engine.is_ok()
+    {
+        Ok(report)
+    } else {
+        Err(Error::Teardown(Failure {
+            termination: report.termination,
+            revision: report.revision,
+            adapter: outcomes.adapter.err(),
+            events: outcomes.events.err(),
+            diagnostics: outcomes.diagnostics.err(),
+            engine: outcomes.engine.err(),
+        }))
+    }
+}
+
+/// How a completed session was asked to terminate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Termination {
+    /// The adapter stopped without an SDK shutdown request.
+    Natural,
+    /// The application explicitly requested coordinated shutdown.
+    Requested,
+}
+
+impl Termination {
+    /// Every termination mode in declaration order.
+    pub const VARIANTS: [Self; 2] = [Self::Natural, Self::Requested];
+}
+
+/// Successful completion of every authority owned by a session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Report {
+    termination: Termination,
+    revision: Revision,
+    capabilities: Capabilities,
+    events_handled: bool,
+    diagnostics_address: Option<SocketAddr>,
+}
+
+impl Report {
+    /// Returns how termination began.
+    #[must_use]
+    pub const fn termination(self) -> Termination {
+        self.termination
+    }
+
+    /// Returns the final canonical world revision.
+    #[must_use]
+    pub const fn revision(self) -> Revision {
+        self.revision
+    }
+
+    /// Returns the adapter facilities active during the session.
+    #[must_use]
+    pub const fn capabilities(self) -> Capabilities {
+        self.capabilities
+    }
+
+    /// Returns whether typed adapter events were owned by an SDK handler.
+    #[must_use]
+    pub const fn events_handled(self) -> bool {
+        self.events_handled
+    }
+
+    /// Returns the bound diagnostic address when a console was configured.
+    #[must_use]
+    pub const fn diagnostics_address(self) -> Option<SocketAddr> {
+        self.diagnostics_address
+    }
+}
+
+/// Every authority failure observed during one coordinated teardown.
+#[derive(Debug, ThisError)]
+#[error("one or more session authorities failed during {termination:?} teardown")]
+pub struct Failure<E>
+where
+    E: StdError + 'static,
+{
+    termination: Termination,
+    revision: Revision,
+    adapter: Option<E>,
+    events: Option<EventError>,
+    diagnostics: Option<viperzoo_web::Error>,
+    engine: Option<engine::TaskError>,
+}
+
+impl<E> Failure<E>
+where
+    E: StdError + 'static,
+{
+    /// Returns how teardown began.
+    #[must_use]
+    pub const fn termination(&self) -> Termination {
+        self.termination
+    }
+
+    /// Returns the final coherent world revision.
+    #[must_use]
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    /// Borrows the adapter failure, when present.
+    #[must_use]
+    pub const fn adapter(&self) -> Option<&E> {
+        self.adapter.as_ref()
+    }
+
+    /// Borrows the SDK event-handler failure, when present.
+    #[must_use]
+    pub const fn events(&self) -> Option<&EventError> {
+        self.events.as_ref()
+    }
+
+    /// Borrows the diagnostic-console failure, when present.
+    #[must_use]
+    pub const fn diagnostics(&self) -> Option<&viperzoo_web::Error> {
+        self.diagnostics.as_ref()
+    }
+
+    /// Borrows the canonical engine failure, when present.
+    #[must_use]
+    pub const fn engine(&self) -> Option<&engine::TaskError> {
+        self.engine.as_ref()
     }
 }
 
@@ -423,51 +853,27 @@ where
     /// No Tokio runtime was available to schedule the canonical engine.
     #[error("unable to start canonical engine: {0}")]
     EngineStart(engine::SpawnError),
-    /// The adapter failed while the engine owner exited normally.
-    #[error("adapter runtime failed: {0}")]
-    Adapter(E),
-    /// The typed event handler failed while other runtime owners exited normally.
+    /// The diagnostic console could not start; cleanup may also have failed.
+    #[error("diagnostic console could not start: {diagnostics}")]
+    DiagnosticsStart {
+        /// Console bind or startup failure.
+        diagnostics: viperzoo_web::Error,
+        /// Engine cleanup failure after the rejected start.
+        engine: Option<engine::TaskError>,
+    },
+    /// The adapter could not start; cleanup retains any additional failures.
+    #[error("adapter could not start: {adapter}")]
+    AdapterStart {
+        /// Adapter startup failure.
+        adapter: E,
+        /// Diagnostic shutdown failure during cleanup.
+        diagnostics: Option<viperzoo_web::Error>,
+        /// Engine cleanup failure during cleanup.
+        engine: Option<engine::TaskError>,
+    },
+    /// Coordinated teardown observed one or more authority failures.
     #[error(transparent)]
-    Events(EventError),
-    /// The engine task failed while the adapter completed normally.
-    #[error("engine owner failed: {0}")]
-    Engine(engine::TaskError),
-    /// Adapter and event-handler ownership both failed during teardown.
-    #[error("adapter runtime failed ({adapter}) and event handler failed ({events})")]
-    AdapterAndEvents {
-        /// Adapter startup or teardown failure.
-        adapter: E,
-        /// Event-handler task failure.
-        events: EventError,
-    },
-    /// Adapter and engine ownership both failed during the same boundary.
-    #[error("adapter runtime failed ({adapter}) and engine owner failed ({engine})")]
-    AdapterAndEngine {
-        /// Adapter startup or teardown failure.
-        adapter: E,
-        /// Engine owner join failure.
-        engine: engine::TaskError,
-    },
-    /// Event-handler and engine ownership both failed during teardown.
-    #[error("event handler failed ({events}) and engine owner failed ({engine})")]
-    EventsAndEngine {
-        /// Event-handler task failure.
-        events: EventError,
-        /// Engine owner join failure.
-        engine: engine::TaskError,
-    },
-    /// Adapter, event-handler, and engine ownership all failed during teardown.
-    #[error(
-        "adapter runtime failed ({adapter}), event handler failed ({events}), and engine owner failed ({engine})"
-    )]
-    AdapterEventsAndEngine {
-        /// Adapter startup or teardown failure.
-        adapter: E,
-        /// Event-handler task failure.
-        events: EventError,
-        /// Engine owner join failure.
-        engine: engine::TaskError,
-    },
+    Teardown(#[from] Failure<E>),
 }
 
 #[cfg(test)]
@@ -480,7 +886,11 @@ mod tests {
         },
     };
 
-    use viperzoo_adapter_api::{action::MockClient, observation, runtime::MockDriver};
+    use viperzoo_adapter_api::{
+        action::MockClient,
+        observation,
+        runtime::{Capabilities, Capability, MockDriver},
+    };
     use viperzoo_world::revision::Revision;
 
     use super::*;
@@ -502,6 +912,10 @@ mod tests {
         type Error = Infallible;
         type Event = Event;
         type Events = tokio_stream::Iter<std::array::IntoIter<Event, 1>>;
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::new(&[Capability::Actions, Capability::Events])
+        }
 
         async fn start<S>(
             self,
@@ -535,6 +949,20 @@ mod tests {
         }
     }
 
+    fn naturally_stopping_fake() -> Fake {
+        let mut driver = MockDriver::new();
+        driver.expect_is_finished().returning(|| false);
+        driver
+            .expect_shutdown()
+            .times(1)
+            .returning(|| Box::pin(std::future::ready(Ok(()))));
+
+        Fake {
+            client: MockClient::new(),
+            driver,
+        }
+    }
+
     #[tokio::test]
     async fn session_owns_adapter_and_engine_as_one_lifecycle() {
         let session = session()
@@ -544,8 +972,31 @@ mod tests {
             .await
             .expect("fake session starts");
 
-        assert_eq!(session.world.latest().revision(), Revision::INITIAL.next());
-        session.owner.shutdown().await.expect("session stops");
+        assert_eq!(
+            session.world().latest().revision(),
+            Revision::INITIAL.next()
+        );
+        assert!(!session.capabilities().contains(Capability::WarmAttachment));
+
+        let report = session.shutdown().await.expect("session stops");
+
+        assert_eq!(report.termination(), Termination::Requested);
+        assert_eq!(report.revision(), Revision::INITIAL.next());
+        assert!(!report.events_handled());
+    }
+
+    #[tokio::test]
+    async fn natural_facility_completion_coordinates_the_remaining_authorities() {
+        let session = session()
+            .adapter(naturally_stopping_fake())
+            .on_event(drop)
+            .start()
+            .await
+            .expect("session starts");
+        let report = session.wait().await.expect("session stops");
+
+        assert_eq!(report.termination(), Termination::Natural);
+        assert!(report.events_handled());
     }
 
     #[tokio::test]
@@ -563,7 +1014,7 @@ mod tests {
             .await
             .expect("handled session starts");
 
-        session.owner.shutdown().await.expect("session stops");
+        session.shutdown().await.expect("session stops");
 
         assert_eq!(handled.load(Ordering::Relaxed), 1);
     }
@@ -578,11 +1029,13 @@ mod tests {
             .expect("handled session starts");
 
         let error = session
-            .owner
             .shutdown()
             .await
             .expect_err("handler panic crosses the owner boundary");
 
-        assert!(matches!(error, Error::Events(_)));
+        assert!(matches!(
+            error,
+            Error::Teardown(ref failure) if failure.events().is_some()
+        ));
     }
 }

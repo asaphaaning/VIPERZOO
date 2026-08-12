@@ -97,6 +97,18 @@ impl runtime::Adapter for Adapter {
     type Event = Event;
     type Events = Events;
 
+    fn capabilities(&self) -> runtime::Capabilities {
+        runtime::Capabilities::new(&[
+            runtime::Capability::Actions,
+            runtime::Capability::Events,
+            runtime::Capability::WarmAttachment,
+        ])
+        .with_if(
+            runtime::Capability::Recording,
+            self.config.recording().is_enabled(),
+        )
+    }
+
     async fn start<S>(self, sink: S) -> Result<Running, Self::Error>
     where
         S: observation::Sink + Clone,
