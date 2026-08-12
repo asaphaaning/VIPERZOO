@@ -111,6 +111,16 @@ impl<A> Builder<A> {
         self.diagnostics = Some(diagnostics);
         self
     }
+
+    /// Adds a diagnostic console when `diagnostics` is present.
+    #[must_use = "the returned builder contains the selected diagnostic console"]
+    pub fn diagnostics_maybe(mut self, diagnostics: Option<diagnostics::Console>) -> Self {
+        if let Some(diagnostics) = diagnostics {
+            self = self.diagnostics(diagnostics);
+        }
+
+        self
+    }
 }
 
 impl<A> Builder<A>
@@ -175,6 +185,13 @@ impl<A, F> HandledBuilder<A, F> {
     /// Adds an SDK-owned browser diagnostic console.
     pub fn diagnostics(mut self, diagnostics: diagnostics::Console) -> Self {
         self.builder = self.builder.diagnostics(diagnostics);
+        self
+    }
+
+    /// Adds a diagnostic console when `diagnostics` is present.
+    #[must_use = "the returned builder contains the selected diagnostic console"]
+    pub fn diagnostics_maybe(mut self, diagnostics: Option<diagnostics::Console>) -> Self {
+        self.builder = self.builder.diagnostics_maybe(diagnostics);
         self
     }
 }
