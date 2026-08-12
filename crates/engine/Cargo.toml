@@ -6,16 +6,31 @@ rust-version.workspace = true
 version.workspace      = true
 
 [dependencies]
-thiserror.workspace  = true
-tokio                = { workspace = true, features = [ "rt", "sync", "time" ] }
-tracing.workspace    = true
-viperzoo-adapter-api = { version = "0.1.0", path = "../adapter-api" }
-viperzoo-world       = { version = "0.1.0", path = "../world" }
+thiserror.workspace = true
+tracing.workspace   = true
+
+[dependencies.tokio]
+features  = [ "rt", "sync", "time" ]
+workspace = true
+
+[dependencies.viperzoo-adapter-api]
+path    = "../adapter-api"
+version = "0.1.0"
+
+[dependencies.viperzoo-world]
+path    = "../world"
+version = "0.1.0"
 
 [dev-dependencies]
-hex.workspace     = true
-tokio             = { workspace = true, features = [ "macros", "rt", "sync" ] }
-viperzoo-protocol = { version = "0.1.0", path = "../protocol" }
+hex.workspace = true
+
+[dev-dependencies.tokio]
+features  = [ "macros", "rt", "sync" ]
+workspace = true
+
+[dev-dependencies.viperzoo-protocol]
+path    = "../protocol"
+version = "0.1.0"
 
 [lints]
 workspace = true

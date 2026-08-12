@@ -1,6 +1,6 @@
 [package]
-name        = "viperzoo-web"
-description = "Browser projection of the live engine world state and tracing stream."
+name                   = "viperzoo-web"
+description            = "Browser projection of the live engine world state and tracing stream."
 edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
@@ -10,18 +10,44 @@ version.workspace      = true
 workspace = true
 
 [dependencies]
-axum               = { workspace = true }
-serde              = { workspace = true }
-serde_json         = { workspace = true }
-thiserror          = { workspace = true }
-tokio              = { workspace = true, features = [ "net", "rt", "sync", "time" ] }
-tokio-stream       = { workspace = true }
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
-viperzoo-assets      = { path = "../assets" }
-viperzoo-engine      = { path = "../engine" }
-viperzoo-protocol    = { path = "../protocol" }
-viperzoo-world       = { path = "../world" }
+[dependencies.axum]
+workspace = true
+
+[dependencies.serde]
+workspace = true
+
+[dependencies.serde_json]
+workspace = true
+
+[dependencies.thiserror]
+workspace = true
+
+[dependencies.tokio]
+features  = [ "net", "rt", "sync", "time" ]
+workspace = true
+
+[dependencies.tokio-stream]
+workspace = true
+
+[dependencies.tracing]
+workspace = true
+
+[dependencies.tracing-subscriber]
+workspace = true
+
+[dependencies.viperzoo-assets]
+path = "../assets"
+
+[dependencies.viperzoo-engine]
+path = "../engine"
+
+[dependencies.viperzoo-protocol]
+path = "../protocol"
+
+[dependencies.viperzoo-world]
+path = "../world"
 
 [dev-dependencies]
-tokio = { workspace = true, features = [ "macros", "rt" ] }
+[dev-dependencies.tokio]
+features  = [ "macros", "rt" ]
+workspace = true

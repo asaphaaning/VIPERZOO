@@ -8,9 +8,18 @@ version.workspace      = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace   = true
-viperzoo-assets     = { version = "0.1.0", path = "../assets" }
-viperzoo-protocol   = { version = "0.1.0", path = "../protocol" }
-viperzoo-world      = { version = "0.1.0", path = "../world" }
+
+[dependencies.viperzoo-assets]
+path    = "../assets"
+version = "0.1.0"
+
+[dependencies.viperzoo-protocol]
+path    = "../protocol"
+version = "0.1.0"
+
+[dependencies.viperzoo-world]
+path    = "../world"
+version = "0.1.0"
 
 [dev-dependencies]
 hex.workspace = true
