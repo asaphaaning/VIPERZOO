@@ -9,10 +9,12 @@
 //! with canonical post-dispatch world evidence.
 
 pub mod action;
+pub mod diagnostics;
 mod session;
 
 pub use session::{
-    Builder, Error, EventError, HandledBuilder, HandledSession, Owner, Session, session,
+    Builder, Error, EventError, Failure, HandledBuilder, HandledSession, Report, Session,
+    Termination, session,
 };
 
 pub use viperzoo_actions as actions;

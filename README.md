@@ -20,9 +20,10 @@ viperzoo-adapter-frida = { path = "../../crates/adapter-frida" }
 viperzoo-sdk = { path = "../../crates/sdk" }
 ```
 
-The SDK owns the canonical engine and adapter lifecycle. A started session
-exposes only the independent capabilities an application uses: semantic
-actions, the coherent world, and one teardown owner.
+The SDK owns the canonical engine, adapter, event handler, and any selected
+diagnostic console as one lifecycle. A started session exposes only the
+facilities an application uses: semantic actions, the coherent world, static
+assets, active adapter capabilities, and direct lifecycle methods.
 
 ```rust
 use viperzoo_adapter_frida as frida;
@@ -41,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let position = session
-        .world
+        .world()
         .wait(query::position::known())
         .run()
         .await?;
@@ -53,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let refreshed = session
-        .actions
+        .actions()
         .perform(Action::RefreshMap)
         .confirm(query::position::known())
         .within(Duration::from_secs(2))
@@ -61,7 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!("refresh confirmed at revision {}", refreshed.evidence().revision().value());
-    session.owner.shutdown().await?;
+    let report = session.shutdown().await?;
+    println!("stopped at revision {}", report.revision().value());
 
     Ok(())
 }
@@ -73,6 +75,13 @@ canonical-world evidence. `on_event` receives the adapter's closed, typed event
 vocabulary; applications that need the stream directly can omit it, while
 applications that intentionally do not use diagnostics can select
 `.discard_events()`.
+
+Optional facilities stay on the same fluent surface. Add `.load_assets()?` to
+make the installed collision catalog available through `session.assets()`, or
+add `.diagnostics(viperzoo_sdk::diagnostics::Console::new(address))` to make the
+browser console part of the session's coordinated shutdown. Adapter-specific
+configuration, such as Frida recording, remains on that adapter; inspect the
+resulting closed vocabulary with `session.capabilities()`.
 
 ## Workspace
 

@@ -17,6 +17,7 @@ viperzoo-engine      = { version = "0.1.0", path = "../engine" }
 viperzoo-navigation  = { version = "0.1.0", path = "../navigation" }
 viperzoo-protocol    = { version = "0.1.0", path = "../protocol" }
 viperzoo-world       = { version = "0.1.0", path = "../world" }
+viperzoo-web         = { version = "0.1.0", path = "../web" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = [ "macros", "rt" ] }

@@ -50,6 +50,14 @@ pub enum Recording {
     Jsonl(PathBuf),
 }
 
+impl Recording {
+    /// Returns whether callback evidence will be persisted.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        matches!(self, Self::Jsonl(_))
+    }
+}
+
 /// Complete direct attachment configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {

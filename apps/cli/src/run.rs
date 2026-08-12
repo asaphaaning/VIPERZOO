@@ -23,10 +23,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
         .on_event(report_event)
         .start()
         .await?;
-    let _actions = session.actions;
-    let world = session.world;
-    let owner = session.owner;
-    let mut snapshots = world.subscribe();
+    let mut snapshots = session.world().subscribe();
 
     let stop = loop {
         tokio::select! {
@@ -34,7 +31,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 result?;
                 break Stop::Interrupted;
             }
-            () = owner.finished() => break Stop::Detached,
+            () = session.finished() => break Stop::Detached,
             result = snapshots.changed() => {
                 let snapshot = result.map_err(|_| Error::WorldStopped)?;
                 print_summary(&snapshot);
@@ -43,9 +40,9 @@ pub async fn run(config: Config) -> Result<(), Error> {
     };
 
     match stop {
-        Stop::Interrupted => owner.shutdown().await?,
-        Stop::Detached => owner.wait().await?,
-    }
+        Stop::Interrupted => session.shutdown().await?,
+        Stop::Detached => session.wait().await?,
+    };
 
     Ok(())
 }
