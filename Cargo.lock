@@ -1744,20 +1744,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "viperzoo-woodcut"
-version = "0.1.0"
-dependencies = [
- "hex",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "viperzoo-adapter-frida",
- "viperzoo-sdk",
- "viperzoo-web",
-]
-
-[[package]]
 name = "viperzoo-world"
 version = "0.1.0"
 dependencies = [
