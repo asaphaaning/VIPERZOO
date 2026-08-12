@@ -9,18 +9,36 @@ version.workspace      = true
 serde.workspace              = true
 serde_json.workspace         = true
 thiserror.workspace          = true
-tokio = { workspace = true, features = [ "fs", "io-util", "macros", "rt" ] }
 tokio-stream.workspace       = true
 tokio-util.workspace         = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
-viperzoo-adapter-api         = { version = "0.1.0", path = "../../crates/adapter-api" }
-viperzoo-capture             = { version = "0.1.0", path = "../../crates/capture" }
-viperzoo-engine              = { version = "0.1.0", path = "../../crates/engine" }
-viperzoo-world               = { version = "0.1.0", path = "../../crates/world" }
+
+[dependencies.tokio]
+features  = [ "fs", "io-util", "macros", "rt" ]
+workspace = true
+
+[dependencies.viperzoo-adapter-api]
+path    = "../../crates/adapter-api"
+version = "0.1.0"
+
+[dependencies.viperzoo-capture]
+path    = "../../crates/capture"
+version = "0.1.0"
+
+[dependencies.viperzoo-engine]
+path    = "../../crates/engine"
+version = "0.1.0"
+
+[dependencies.viperzoo-world]
+path    = "../../crates/world"
+version = "0.1.0"
 
 [dev-dependencies]
-viperzoo-protocol = { version = "0.1.0", path = "../../crates/protocol" }
+
+[dev-dependencies.viperzoo-protocol]
+path    = "../../crates/protocol"
+version = "0.1.0"
 
 [lints]
 workspace = true

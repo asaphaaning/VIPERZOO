@@ -8,6 +8,8 @@ RPG made a deep impression on me when I was younger.
 It is my own spin on his defining contribution: A research project on the
 same game, built on a reverse-engineered protocol and a deterministic engine.
 
+![VIPERZOO web console](assets/web-console.png)
+
 ## Quick start
 
 For a new application under `apps/`, add the SDK and the adapter that supplies

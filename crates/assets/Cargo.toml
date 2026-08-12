@@ -8,7 +8,10 @@ version.workspace      = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace   = true
-viperzoo-protocol   = { version = "0.1.0", path = "../protocol" }
+
+[dependencies.viperzoo-protocol]
+path    = "../protocol"
+version = "0.1.0"
 
 [lints]
 workspace = true

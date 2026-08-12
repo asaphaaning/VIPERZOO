@@ -22,22 +22,41 @@ rust-version = "1.97"
 version      = "0.1.0"
 
 [workspace.dependencies]
-bytes = "1.11"
-frida = { git = "https://github.com/frida/frida-rust", rev = "080e8a99a542150359c835cd8b572f699f7a2313", features = [
-  "auto-download",
-] }
-axum = { version = "0.8", default-features = false, features = [ "http1", "json", "tokio" ] }
-hex = "0.4.3"
-futures-core = "0.3.31"
-mockall = "0.15"
-serde = { version = "1.0.228", features = [ "derive" ] }
-serde_json = "1.0.149"
-thiserror = "2.0.17"
-tokio = "1.49"
-tokio-stream = { version = "0.1", features = [ "sync" ] }
-tokio-util = { version = "0.7", features = [ "codec" ] }
-tracing = "0.1"
+bytes              = "1.11"
+futures-core       = "0.3.31"
+hex                = "0.4.3"
+mockall            = "0.15"
+serde_json         = "1.0.149"
+thiserror          = "2.0.17"
+tokio              = "1.49"
+tracing            = "0.1"
 tracing-subscriber = "0.3"
+
+[workspace.dependencies.axum]
+default-features = false
+features = [
+  "http1",
+  "json",
+  "tokio",
+]
+version = "0.8"
+
+[workspace.dependencies.frida]
+features = [ "auto-download" ]
+git      = "https://github.com/frida/frida-rust"
+rev      = "080e8a99a542150359c835cd8b572f699f7a2313"
+
+[workspace.dependencies.serde]
+features = [ "derive" ]
+version  = "1.0.228"
+
+[workspace.dependencies.tokio-stream]
+features = [ "sync" ]
+version  = "0.1"
+
+[workspace.dependencies.tokio-util]
+features = [ "codec" ]
+version  = "0.7"
 
 [workspace.lints.rust]
 # `viperzoo-adapter-frida` contains the one audited FFI boundary. Keeping this
@@ -47,7 +66,6 @@ unsafe_code     = "deny"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
-all                    = { level = "warn", priority = -1 }
 dbg_macro              = "deny"
 expect_used            = "deny"
 panic                  = "deny"
@@ -57,3 +75,7 @@ unimplemented          = "deny"
 unreachable            = "deny"
 unwrap_used            = "deny"
 wildcard_imports       = "deny"
+
+[workspace.lints.clippy.all]
+level    = "warn"
+priority = -1
