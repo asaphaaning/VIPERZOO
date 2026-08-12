@@ -83,6 +83,13 @@ browser console part of the session's coordinated shutdown. Adapter-specific
 configuration, such as Frida recording, remains on that adapter; inspect the
 resulting closed vocabulary with `session.capabilities()`.
 
+## Web Console
+
+The browser console presents the active world, character state, entities,
+inventory, decoder coverage, and tracing output in one live view.
+
+![VIPERZOO web console](assets/web-console.png)
+
 ## Workspace
 
 ### Crates
